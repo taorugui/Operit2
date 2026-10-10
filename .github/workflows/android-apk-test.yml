@@ -149,6 +149,12 @@ jobs:
           RELEASE_KEY_PASSWORD=$password
           "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
 
+      - name: Install TypeScript compiler for plugin build hook
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-save --no-audit --no-fund typescript@5.9.3
+          if (-not (Test-Path .ci-tools/typescript/node_modules/.bin/tsc.cmd)) { throw "TypeScript compiler not installed" }
+
       - name: Prepare Python virtual environment for Flutter build hook
         shell: pwsh
         run: |
