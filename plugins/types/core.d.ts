@@ -1,6 +1,11 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
 /**
+ * Contains a JSON object with complete values preserved by the native JSON parser.
+ */
+export type JsonObject = Record<string, unknown>;
+
+/**
  * Stores a scalar or JSON value assigned to an arbitrary tool parameter.
  */
 export type ToolParamsAdditionalValue = string | number | boolean | unknown;
@@ -32,6 +37,50 @@ export interface ToolConfig {
    * Receives intermediate values produced by a streaming tool.
    */
   onIntermediateResult?: (arg0: any) => void;
+}
+
+/**
+ * Describes one parameter accepted by a public tool.
+ */
+export interface ToolCatalogParameter {
+  name: string;
+  type: string;
+  description: string;
+  required: boolean;
+  default: any;
+}
+
+/**
+ * Describes a public builtin or plugin tool available on a device.
+ */
+export interface ToolCatalogEntry {
+  name: string;
+  description: string;
+  parameters: ToolCatalogParameter[];
+  category: string;
+  source: string;
+  packageName?: string;
+}
+
+/**
+ * Contains public tool names and schemas returned by device discovery.
+ */
+export interface ToolCatalog {
+  tools: ToolCatalogEntry[];
+}
+
+/**
+ * Configures the lifetime of calls issued through Tools.device(nodeId).
+ */
+export interface DeviceToolOptions {
+  /**
+   * Maximum duration including connection and permission checks; defaults to 120000 ms.
+   */
+  timeoutMs?: number;
+  /**
+   * Optional AbortSignal. Aborting closes the remote execution stream.
+   */
+  signal?: object;
 }
 
 /**
@@ -222,6 +271,57 @@ export declare const dataUtils: DataUtilsApi;
  * Stores the named values assigned to CommonJS module exports.
  */
 export declare var exports: Record<string, any>;
+
+declare global {
+  /**
+   * Represents the standard cancellation signal available in every plugin runtime.
+   */
+  export interface AbortSignal {
+    /**
+     * Indicates whether cancellation has already been requested.
+     */
+    readonly aborted: boolean;
+    /**
+     * Carries the reason passed to AbortController.abort.
+     */
+    readonly reason: any;
+    /**
+     * Registers an abort event listener.
+     */
+    addEventListener(event: string, listener: () => void): void;
+    /**
+     * Removes a registered abort event listener.
+     */
+    removeEventListener(event: string, listener: () => void): void;
+    /**
+     * Throws the cancellation reason when this signal is aborted.
+     */
+    throwIfAborted(): void;
+  }
+
+  /**
+   * Owns one standard cancellation signal.
+   */
+  export interface AbortController {
+    /**
+     * Exposes the signal passed to cancellable SDK operations.
+     */
+    readonly signal: AbortSignal;
+    /**
+     * Cancels the owned signal exactly once with an optional reason.
+     */
+    abort(reason?: any): void;
+  }
+
+  export var AbortController: {
+    prototype: AbortController;
+    /**
+     * Creates an initially active abort controller.
+     */
+    new(): AbortController;
+  };
+
+}
 
 /**
  * Global function to complete tool execution with a result

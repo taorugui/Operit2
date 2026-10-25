@@ -13,6 +13,8 @@ class ComposeDslLazyListView extends ListView {
     required super.reverse,
     required super.shrinkWrap,
     required super.childrenDelegate,
+    super.itemExtent,
+    super.cacheExtent,
   }) : super.custom(padding: EdgeInsets.zero);
 
   /// Uses one content-measuring viewport for both list axes and sizing modes.
@@ -27,6 +29,7 @@ class ComposeDslLazyListView extends ListView {
     offset: offset,
     slivers: slivers,
     shrinkWrap: shrinkWrap,
+    itemCacheExtent: cacheExtent,
     clipBehavior: clipBehavior,
     paintOrder: paintOrder,
   );
@@ -40,11 +43,13 @@ class _ComposeLazyViewport extends ShrinkWrappingViewport {
     required super.offset,
     required super.slivers,
     required this.shrinkWrap,
+    required this.itemCacheExtent,
     required super.clipBehavior,
     required super.paintOrder,
   });
 
   final bool shrinkWrap;
+  final double? itemCacheExtent;
 
   /// Creates the sliver viewport without requiring a bounded cross axis.
   @override
@@ -57,6 +62,7 @@ class _ComposeLazyViewport extends ShrinkWrappingViewport {
         ),
         offset: offset,
         shrinkWrap: shrinkWrap,
+        itemCacheExtent: itemCacheExtent,
         clipBehavior: clipBehavior,
         paintOrder: paintOrder,
       );
@@ -68,7 +74,9 @@ class _ComposeLazyViewport extends ShrinkWrappingViewport {
     _RenderComposeLazyViewport renderObject,
   ) {
     super.updateRenderObject(context, renderObject);
-    renderObject.shrinkWrap = shrinkWrap;
+    renderObject
+      ..shrinkWrap = shrinkWrap
+      ..cacheExtent = itemCacheExtent;
   }
 }
 
@@ -82,7 +90,10 @@ class _RenderComposeLazyViewport extends RenderShrinkWrappingViewport {
     required super.clipBehavior,
     required super.paintOrder,
     required bool shrinkWrap,
-  }) : _shrinkWrap = shrinkWrap;
+    required double? itemCacheExtent,
+  }) : _shrinkWrap = shrinkWrap {
+    cacheExtent = itemCacheExtent;
+  }
 
   bool _shrinkWrap;
   double _availableCrossAxisExtent = 0;
@@ -116,8 +127,17 @@ class _RenderComposeLazyViewport extends RenderShrinkWrappingViewport {
       );
     }
     if (_availableCrossAxisExtent != crossLimit) {
-      _availableCrossAxisExtent = crossLimit;
-      _visitComposeListItems(this, (item) => item.markNeedsLayout());
+      // Item measurement also depends on this limit, beyond its sliver box
+      // constraints. Invalidate through Flutter's layout callback protocol:
+      // direct descendant mutation during performLayout is forbidden.
+      invokeLayoutCallback<BoxConstraints>((_) {
+        _availableCrossAxisExtent = crossLimit;
+        _visitComposeListItems(
+          this,
+          (item) => item.markNeedsLayout(),
+          includeKeptAlive: true,
+        );
+      });
     }
     var crossExtent = _constrainCrossAxis(0);
     while (true) {
@@ -238,16 +258,17 @@ class _RenderComposeLazyViewport extends RenderShrinkWrappingViewport {
   }
 }
 
-/// Visits laid-out list items without including retained offscreen or nested lists.
+/// Visits active items for measurement, optionally including retained items for invalidation.
 void _visitComposeListItems(
   RenderObject root,
-  void Function(_RenderComposeListItem item) visitor,
-) {
+  void Function(_RenderComposeListItem item) visitor, {
+  bool includeKeptAlive = false,
+}) {
   if (root is _RenderComposeListItem) {
     visitor(root);
     return;
   }
-  if (root is RenderSliverMultiBoxAdaptor) {
+  if (root is RenderSliverMultiBoxAdaptor && !includeKeptAlive) {
     var child = root.firstChild;
     while (child != null) {
       _visitComposeListItems(child, visitor);
@@ -255,7 +276,13 @@ void _visitComposeListItems(
     }
     return;
   }
-  root.visitChildren((child) => _visitComposeListItems(child, visitor));
+  root.visitChildren(
+    (child) => _visitComposeListItems(
+      child,
+      visitor,
+      includeKeptAlive: includeKeptAlive,
+    ),
+  );
 }
 
 /// Measures an item naturally while retaining Flutter's required sliver box size.

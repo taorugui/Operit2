@@ -65,6 +65,25 @@ impl ParsedOperit1Snapshot {
                 detectedDomains.push(name);
             }
         }
+        if self
+            .archive
+            .entries
+            .keys()
+            .any(|entry| isOperit1LegacyMemoryEntry(entry))
+            || self
+                .archive
+                .datastorePreferences
+                .get(ENTRY_USER_PREFERENCES)
+                .is_some_and(|preferences| {
+                    preferences.keys().any(|key| {
+                        key == KEY_ACTIVE_MEMORY_SPACE_ID
+                            || key == KEY_MEMORY_SPACE_LIST
+                            || key.starts_with(KEY_MEMORY_SPACE_PREFIX)
+                    })
+                })
+        {
+            detectedDomains.push("memory".to_string());
+        }
         if importedFileCount > 0 || importedExternalFileCount > 0 {
             detectedDomains.push("user_files".to_string());
         }
@@ -154,7 +173,8 @@ impl ParsedOperit1Snapshot {
             .entries
             .keys()
             .filter(|entry| entry.starts_with(prefix))
-            .filter(|entry| !isArchiveDataStoreEntry(entry))
+            .filter(|entry| !entry.starts_with(ENTRY_DATASTORE_PREFIX))
+            .filter(|entry| !isOperit1LegacyMemoryEntry(entry))
             .count() as i32
     }
 }
@@ -277,6 +297,29 @@ struct Operit1ModelConfig {
     maxConcurrentRequests: i32,
 }
 
+/// Matches custom parameter records emitted by Operit1's Kotlin serializer.
+#[derive(Deserialize)]
+struct Operit1CustomParameterData {
+    id: String,
+    name: String,
+    apiName: String,
+    #[serde(default)]
+    description: String,
+    defaultValue: String,
+    currentValue: String,
+    isEnabled: bool,
+    valueType: String,
+    minValue: Option<String>,
+    maxValue: Option<String>,
+    #[serde(default = "defaultOperit1ParameterCategory")]
+    category: String,
+}
+
+/// Reproduces the category omitted by Operit1 when it has its declared default.
+fn defaultOperit1ParameterCategory() -> String {
+    "OTHER".to_string()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[allow(non_snake_case)]
 struct Operit1ApiKeyInfo {
@@ -349,9 +392,9 @@ impl Operit1ModelConfig {
 
         let providerType = self.apiProviderType.trim();
         if !providerType.is_empty() {
-            return self.knownProviderType(providerType).ok_or_else(|| {
-                format!("无法识别 Operit1 供应商类型：{}", providerType)
-            });
+            return self
+                .knownProviderType(providerType)
+                .ok_or_else(|| format!("无法识别 Operit1 供应商类型：{}", providerType));
         }
 
         if providerTypeId.is_empty() {
@@ -369,7 +412,7 @@ impl Operit1ModelConfig {
         }
         match providerTypeId.to_ascii_uppercase().as_str() {
             "MNN" | "LLAMA_CPP" => {
-                AppLogger::i(
+                AppLogger::trace_detail(
                     "Operit1SnapshotImport",
                     &format!(
                         "legacy local provider mapped to LOCAL_MODEL configId={} providerType={providerTypeId}",
@@ -397,10 +440,7 @@ impl Operit1ModelConfig {
 }
 
 #[allow(non_snake_case)]
-fn buildModelProfile(
-    modelId: &str,
-    config: &Operit1ModelConfig,
-) -> Result<ModelProfile, String> {
+fn buildModelProfile(modelId: &str, config: &Operit1ModelConfig) -> Result<ModelProfile, String> {
     let mut model = ModelProfile::new(modelId.to_string());
     model.contextOverride = Some(ModelContextSpec {
         maxContextLength: config.maxContextLength,
@@ -436,6 +476,7 @@ fn buildModelProfile(
     Ok(model)
 }
 
+/// Projects legacy standard and custom parameters using each parameter's declared value type.
 #[allow(non_snake_case)]
 fn buildModelParameters(config: &Operit1ModelConfig) -> Result<Vec<ModelParameter<Value>>, String> {
     let mut parameters = Vec::new();
@@ -482,27 +523,28 @@ fn buildModelParameters(config: &Operit1ModelConfig) -> Result<Vec<ModelParamete
         serde_json::json!(config.repetitionPenalty),
     )?;
     if config.hasCustomParameters && config.customParameters.trim() != "[]" {
-        let customParameters: Vec<CustomParameterData> =
+        let customParameters: Vec<Operit1CustomParameterData> =
             serde_json::from_str(&config.customParameters)
                 .map_err(|error| format!("Operit1 自定义模型参数格式不正确：{error}"))?;
         for parameter in customParameters {
+            let valueType = parseParameterValueType(&parameter.valueType)?;
             parameters.push(ModelParameter {
                 id: parameter.id,
                 name: parameter.name,
                 apiName: parameter.apiName,
                 description: parameter.description,
-                defaultValue: parseCustomParameterValue(&parameter.defaultValue)?,
-                currentValue: parseCustomParameterValue(&parameter.currentValue)?,
+                defaultValue: parseCustomParameterValue(&parameter.defaultValue, &valueType)?,
+                currentValue: parseCustomParameterValue(&parameter.currentValue, &valueType)?,
                 isEnabled: parameter.isEnabled,
-                valueType: parseParameterValueType(&parameter.valueType)?,
                 minValue: parameter
                     .minValue
-                    .map(|value| parseCustomParameterValue(&value))
+                    .map(|value| parseCustomParameterValue(&value, &valueType))
                     .transpose()?,
                 maxValue: parameter
                     .maxValue
-                    .map(|value| parseCustomParameterValue(&value))
+                    .map(|value| parseCustomParameterValue(&value, &valueType))
                     .transpose()?,
+                valueType,
                 category: parseParameterCategory(&parameter.category)?,
                 isCustom: true,
             });
@@ -561,6 +603,31 @@ fn splitModelIds(modelName: &str) -> Vec<String> {
 }
 
 impl Operit1PreferenceValue {
+    /// Preserves the released DataStore primitive type while rewriting its declared resource paths.
+    fn toTargetNativePreferenceEntry(
+        &self,
+        key: &str,
+        fileImportPlan: &SnapshotFileImportPlan,
+    ) -> Result<(String, Value), String> {
+        let targetKey = fileImportPlan.rewritePreferenceKey(key)?;
+        let value = match self {
+            Self::Boolean(value) => serde_json::to_value(value),
+            Self::Float(value) => serde_json::to_value(value),
+            Self::Double(value) => serde_json::to_value(value),
+            Self::Int(value) => serde_json::to_value(value),
+            Self::Long(value) => serde_json::to_value(value),
+            Self::StringSet(value) => serde_json::to_value(value),
+            Self::String(value) => {
+                return Ok((
+                    targetKey,
+                    Value::String(fileImportPlan.rewritePreferenceValue(key, value)?),
+                ))
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok((targetKey, value))
+    }
+
     /// Converts one legacy preference value into its target text representation.
     fn toTargetPreferenceStringForKey(
         &self,
@@ -591,4 +658,3 @@ impl Operit1PreferenceValue {
         Ok((targetKey, targetValue))
     }
 }
-

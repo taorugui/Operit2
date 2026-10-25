@@ -1,6 +1,7 @@
 // ignore_for_file: file_names
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
@@ -11,6 +12,25 @@ import 'CoreProxy.dart';
 
 class WebWasmCoreProxy extends CoreProxy {
   const WebWasmCoreProxy();
+
+  /// Calls the independent browser maintenance worker without loading the Core worker.
+  @override
+  Future<Object?> dataRescue(Map<String, Object?> request) async {
+    final ready = globalContext.getProperty<JSPromise<JSAny?>>(
+      '__operitDataRescueReady'.toJS,
+    );
+    await ready.toDart;
+    final callback = globalContext.getProperty<JSFunction>(
+      '__operitDataRescue'.toJS,
+    );
+    final promise =
+        callback.callAsFunction(null, jsonEncode(request).toJS)
+            as JSPromise<JSString>;
+    final encoded = (await promise.toDart).toDart;
+    final response = jsonDecode(encoded) as Map<String, Object?>;
+    if (response['ok'] != true) throw StateError(response['error'] as String);
+    return response['value'];
+  }
 
   /// Reads the browser Host's default logical Runtime storage roots.
   @override
@@ -64,7 +84,7 @@ class WebWasmCoreProxy extends CoreProxy {
   @override
   Future<Uint8List> callBytes(CoreCallRequest request) async {
     return _invokeBytes('call', <JSAny?>[
-      encodeNativeCoreCallRequest(request).toJS,
+      encodeNativeCoreCallRequest(request).toBytes().toJS,
     ]);
   }
 
@@ -72,7 +92,7 @@ class WebWasmCoreProxy extends CoreProxy {
   @override
   Future<Uint8List> callControlBytes(CoreCallRequest request) async {
     return _invokeBytes('controlCall', <JSAny?>[
-      encodeNativeCoreCallRequest(request).toJS,
+      encodeNativeCoreCallRequest(request).toBytes().toJS,
     ]);
   }
 
@@ -80,7 +100,7 @@ class WebWasmCoreProxy extends CoreProxy {
   @override
   Future<CorePushSink> push(CorePushRequest request) async {
     final responseBytes = await _invokeBytes('pushOpen', <JSAny?>[
-      encodeNativeCorePushOpenRequest(request).toJS,
+      encodeNativeCorePushOpenRequest(request).toBytes().toJS,
     ]);
     final pushId = decodeNativeCorePushOpenResult(responseBytes);
     if (pushId != request.requestId) {
@@ -95,7 +115,7 @@ class WebWasmCoreProxy extends CoreProxy {
   @override
   Future<CoreEvent> watchSnapshot(CoreWatchRequest request) async {
     final responseBytes = await _invokeBytes('watchSnapshot', <JSAny?>[
-      encodeNativeCoreWatchSnapshotRequest(request).toJS,
+      encodeNativeCoreWatchSnapshotRequest(request).toBytes().toJS,
     ]);
     return decodeNativeCoreWatchSnapshotResult(responseBytes);
   }
@@ -105,8 +125,7 @@ class WebWasmCoreProxy extends CoreProxy {
     final subscriptionId =
         'web-watch-${DateTime.now().microsecondsSinceEpoch}-${_nextWebWatchSubscriptionIndex++}';
     final controller = StreamController<CoreEvent>();
-    var opened = false;
-    var canceled = false;
+    var openingFailed = false;
     late final JSFunction onEvent;
     onEvent = ((JSUint8Array frameBytes) {
       _dispatchWatchFrame(controller, subscriptionId, frameBytes.toDart);
@@ -116,7 +135,10 @@ class WebWasmCoreProxy extends CoreProxy {
       unawaited(() async {
         try {
           final subscriptionBytes = await _invokeBytes('watchStream', <JSAny?>[
-            encodeNativeCoreWatchStreamRequest(subscriptionId, request).toJS,
+            encodeNativeCoreWatchStreamRequest(
+              subscriptionId,
+              request,
+            ).toBytes().toJS,
             onEvent,
           ]);
           final openedSubscriptionId = decodeNativeCoreWatchStreamResult(
@@ -129,11 +151,8 @@ class WebWasmCoreProxy extends CoreProxy {
                   'web watch subscription id mismatch: $openedSubscriptionId',
             );
           }
-          opened = true;
-          if (canceled) {
-            await _closeNativeWebWatchStream(subscriptionId);
-          }
         } catch (error, stackTrace) {
+          openingFailed = true;
           if (!controller.isClosed) {
             controller.addError(error, stackTrace);
             await controller.close();
@@ -142,8 +161,7 @@ class WebWasmCoreProxy extends CoreProxy {
       }());
     };
     controller.onCancel = () async {
-      canceled = true;
-      if (opened) {
+      if (!openingFailed) {
         await _closeNativeWebWatchStream(subscriptionId);
       }
     };
@@ -169,7 +187,7 @@ class _WebCorePushSink implements CorePushSink {
     final sequence = _sequence++;
     _tail = _tail.then((_) async {
       final responseBytes = await _invokeBytes('pushItem', <JSAny?>[
-        encodeNativeCorePushItem(_pushId, sequence, args).toJS,
+        encodeNativeCorePushItem(_pushId, sequence, args).toBytes().toJS,
       ]);
       decodeNativeCoreVoidResult(responseBytes);
     });
@@ -193,6 +211,7 @@ class _WebCorePushSink implements CorePushSink {
 
 int _nextWebWatchSubscriptionIndex = 0;
 
+/// Routes explicit value, error, and terminal notifications from the shared owner.
 void _dispatchWatchFrame(
   StreamController<CoreEvent> controller,
   String subscriptionId,
@@ -202,18 +221,30 @@ void _dispatchWatchFrame(
     return;
   }
   try {
-    final frame = decodeNativeCoreWatchFrame(frameBytes);
-    if (frame.subscriptionId != subscriptionId) {
-      throw CoreLinkError(
-        code: 'INVALID_RESPONSE',
-        message: 'web watch subscription id mismatch: ${frame.subscriptionId}',
-      );
+    if (frameBytes.length < 9) {
+      throw const FormatException('Truncated Core watch frame');
     }
-    final event = frame.event;
-    controller.add(event);
-    if (event.kind == 'Completed') {
-      unawaited(_closeNativeWebWatchStream(subscriptionId));
-      unawaited(controller.close());
+    final payload = Uint8List.sublistView(frameBytes, 9);
+    switch (frameBytes[0]) {
+      case 1:
+        final frame = decodeNativeCoreWatchFrame(payload);
+        if (frame.subscriptionId != subscriptionId) {
+          throw CoreLinkError(
+            code: 'INVALID_RESPONSE',
+            message:
+                'web watch subscription id mismatch: ${frame.subscriptionId}',
+          );
+        }
+        controller.add(frame.event);
+      case 2:
+        decodeNativeCoreVoidResult(payload);
+        throw const FormatException('Expected Core watch error');
+      case 3:
+        unawaited(controller.close());
+      default:
+        throw FormatException(
+          'Unknown Core watch frame kind: ${frameBytes[0]}',
+        );
     }
   } catch (error, stackTrace) {
     controller.addError(error, stackTrace);

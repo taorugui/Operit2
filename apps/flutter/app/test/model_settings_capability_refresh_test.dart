@@ -174,8 +174,7 @@ void main() {
             inputState: core.InputProcessingState.idle(),
             viewModel: viewModel,
             currentChatId: 'model-sync-chat',
-            currentCharacterCardName: null,
-            currentCharacterCardAvatarUri: null,
+
             onSendMessage: () {},
             onQueueMessage: () {},
             onCancelMessage: () {},
@@ -258,6 +257,7 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
     summaryMessageCountThreshold: 0,
   );
   static const localRuntime = core.LocalModelRuntimeSettings(
+    inferenceBindingKey: '',
     mnnForwardType: 0,
     mnnThreadCount: 4,
     llamaThreadCount: 4,
@@ -376,7 +376,6 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
         result = model.toJson();
       case 'getAllTtsConfigs':
       case 'getAllSttConfigs':
-      case 'getAllCharacterCards':
         result = <Object?>[];
       case 'getCurrentTtsConfigId':
       case 'getSelectedSttConfigId':

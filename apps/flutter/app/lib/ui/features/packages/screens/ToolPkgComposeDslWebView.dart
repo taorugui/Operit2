@@ -16,6 +16,7 @@ import '../../../../core/logging/ClientLogger.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import 'ToolPkgComposeDslWebViewResourceLoader.dart';
+import 'ComposeDslImageSource.dart';
 import 'ToolPkgComposeDslWebViewBridgeRuntime.dart';
 
 export 'ToolPkgComposeDslWebViewBridgeRuntime.dart'
@@ -32,21 +33,51 @@ typedef ComposeDslWebViewRuntimeOptionsProvider =
     Map<String, Object?> Function();
 
 class ComposeDslWebViewHostContext {
+  /// Creates the action bridge and its post-response completion observer.
   const ComposeDslWebViewHostContext({
     required this.packageName,
     required this.routeInstanceId,
     required this.executionContextKey,
     required this.dispatchAction,
     required this.runtimeOptionsProvider,
+    this.clients = const GeneratedCoreProxyClients(ProxyCoreRuntimeBridge()),
+    this.onActionResultDelivered,
+    this.readFileBytes,
   });
 
   /// Stable plugin package identity, not the transient execution/session key.
+  final GeneratedCoreProxyClients clients;
   final String packageName;
   final String routeInstanceId;
   final String executionContextKey;
   final ComposeDslWebViewActionDispatcher dispatchAction;
   final ComposeDslWebViewRuntimeOptionsProvider runtimeOptionsProvider;
 
+  /// Supplies the owning launcher's generic VFS service to native resources.
+  final Future<Uint8List> Function(String path)? readFileBytes;
+
+  Future<Uint8List> readResourceBytes(String path) =>
+      readFileBytes?.call(path) ??
+      readComposeDslVfsBytes(_runtimeClients, path);
+
+  /// Observes action results only after the WebView receives its bridge response.
+  final ValueChanged<Object?>? onActionResultDelivered;
+
+  /// Binds blocking actions to an occurrence while preserving its host services and result observer.
+  ComposeDslWebViewHostContext withActionDispatcher(
+    ComposeDslWebViewActionDispatcher dispatcher,
+  ) => ComposeDslWebViewHostContext(
+    clients: clients,
+    packageName: packageName,
+    routeInstanceId: routeInstanceId,
+    executionContextKey: executionContextKey,
+    dispatchAction: dispatcher,
+    runtimeOptionsProvider: runtimeOptionsProvider,
+    readFileBytes: readFileBytes,
+    onActionResultDelivered: onActionResultDelivered,
+  );
+
+  /// Executes an action while retaining errors for the requesting WebView.
   Future<ComposeDslWebViewBlockingActionResult> executeAction({
     required String actionId,
     Object? payload,
@@ -174,10 +205,11 @@ class ComposeDslWebViewHostRegistry {
         (name, methods) => MapEntry(name, Map<String, String>.of(methods)),
       ),
     );
-    ClientLogger.i(
+    ClientLogger.v(
       'event=controller_bind context=$executionContextKey route=$routeInstanceId '
       'key=$controllerKey boundKeys=${scopedBindings.keys.join(',')}',
       tag: _composeDslWebViewLogTag,
+      verboseLevel: VerboseLevel.level4,
     );
   }
 
@@ -193,10 +225,11 @@ class ComposeDslWebViewHostRegistry {
     final current = scopedBindings[controllerKey];
     if (current?.controller == controller) {
       scopedBindings.remove(controllerKey);
-      ClientLogger.i(
+      ClientLogger.v(
         'event=controller_unbind context=$executionContextKey key=$controllerKey '
         'remainingKeys=${scopedBindings.keys.join(',')}',
         tag: _composeDslWebViewLogTag,
+        verboseLevel: VerboseLevel.level4,
       );
     }
     if (scopedBindings.isEmpty) {
@@ -210,9 +243,10 @@ class ComposeDslWebViewHostRegistry {
     }
     _bindings.remove(executionContextKey);
     _javascriptInterfaceActionIds.remove(executionContextKey);
-    ClientLogger.i(
+    ClientLogger.v(
       'event=controller_context_clear context=$executionContextKey',
       tag: _composeDslWebViewLogTag,
+      verboseLevel: VerboseLevel.level4,
     );
   }
 
@@ -359,29 +393,32 @@ class ComposeDslWebViewHostRegistry {
     final commandDetail = command == 'evaluateJavascript'
         ? 'scriptChars=${_string(commandPayload['script']).length}'
         : 'payloadKeys=${commandPayload.keys.join(',')}';
-    ClientLogger.d(
+    ClientLogger.v(
       'event=controller_command_start context=$executionContextKey '
       'key=$controllerKey command=$command $commandDetail '
       'bound=${binding != null}',
       tag: _composeDslWebViewLogTag,
+      verboseLevel: VerboseLevel.level3,
     );
     if (binding == null) {
       final boundKeys = _bindings[executionContextKey]?.keys.join(',') ?? '';
       if (command == 'getState') {
-        ClientLogger.d(
+        ClientLogger.v(
           'event=controller_command_pending_binding '
           'context=$executionContextKey key=$controllerKey command=$command '
           'boundKeys=$boundKeys',
           tag: _composeDslWebViewLogTag,
+          verboseLevel: VerboseLevel.level3,
         );
         return _bridgeSuccess(null);
       }
       if (command == 'addJavascriptInterface') {
-        ClientLogger.d(
+        ClientLogger.v(
           'event=controller_command_pending_binding '
           'context=$executionContextKey key=$controllerKey command=$command '
           'boundKeys=$boundKeys',
           tag: _composeDslWebViewLogTag,
+          verboseLevel: VerboseLevel.level3,
         );
         return _registerJavascriptInterfaceCommand(
           executionContextKey: executionContextKey,
@@ -390,11 +427,12 @@ class ComposeDslWebViewHostRegistry {
         );
       }
       if (command == 'removeJavascriptInterface') {
-        ClientLogger.d(
+        ClientLogger.v(
           'event=controller_command_pending_binding '
           'context=$executionContextKey key=$controllerKey command=$command '
           'boundKeys=$boundKeys',
           tag: _composeDslWebViewLogTag,
+          verboseLevel: VerboseLevel.level3,
         );
         return _unregisterJavascriptInterfaceCommand(
           executionContextKey: executionContextKey,
@@ -459,10 +497,11 @@ class ComposeDslWebViewHostRegistry {
           final script = _string(commandPayload['script']);
           final result = await controller.runJavaScriptReturningResult(script);
           final decoded = _decodePlainJsonValue(result);
-          ClientLogger.d(
+          ClientLogger.v(
             'event=controller_command_done context=$executionContextKey '
             'key=$controllerKey command=$command',
             tag: _composeDslWebViewLogTag,
+            verboseLevel: VerboseLevel.level3,
           );
           return _bridgeSuccess(decoded);
         case 'getState':
@@ -738,6 +777,7 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
     super.dispose();
   }
 
+  /// Composes the WebView with Flutter overlays through the shared platform view.
   @override
   Widget build(BuildContext context) {
     final errorText = _error;
@@ -1373,6 +1413,7 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
     );
   }
 
+  /// Responds to the requesting document before notifying presentation owners.
   Future<void> _handleBridgeMessage(JavaScriptMessage message) async {
     final messageText = message.message;
     final payload = _decodeJsonObject(messageText);
@@ -1381,8 +1422,10 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
     }
     final requestId = _string(payload['id']).trim();
     final type = _string(payload['type']).trim();
+    final hostContext = widget.hostContext;
+    Object? data;
     try {
-      final data = await _handleBridgeRequest(
+      data = await _handleBridgeRequest(
         type: type,
         payload: payload['payload'],
       );
@@ -1395,9 +1438,14 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
         'success': false,
         'message': error.toString(),
       });
+      return;
+    }
+    if (type == 'invoke' || type == 'dispatchAction') {
+      hostContext?.onActionResultDelivered?.call(data);
     }
   }
 
+  /// Dispatches an exact bridge operation and propagates action failures.
   Future<Object?> _handleBridgeRequest({
     required String type,
     required Object? payload,
@@ -1441,6 +1489,9 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
           actionId: actionId,
           payload: _decodePlainJsonValue(map['args']),
         );
+        if (result.message != null) {
+          throw StateError(result.message!);
+        }
         return result.actionResult;
       case 'dispatchAction':
         if (hostContext == null) {
@@ -1455,6 +1506,9 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
           actionId: actionId,
           payload: map['payload'],
         );
+        if (result.message != null) {
+          throw StateError(result.message!);
+        }
         return result.actionResult;
       case 'pickFiles':
         return _pickFiles(_stringMap(payload));
@@ -1463,6 +1517,7 @@ class _ComposeDslWebViewState extends State<ComposeDslWebView> {
     }
   }
 
+  /// Awaits delivery of the response to the owning JavaScript document.
   Future<void> _postBridgeResponse(
     String requestId,
     Map<String, Object?> response,

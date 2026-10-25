@@ -152,7 +152,7 @@ async fn exchange(transport: PeerTransport) {
         CoreLinkRequest::Push(CoreLinkPushRequestMessage::Item(CorePushItem {
             pushId: "p".into(),
             sequence: 0,
-            args: CoreValue::Bytes(vec![7; 70000]),
+            args: CoreValue::Bytes(vec![7; 70000].into()),
         })),
         CoreLinkRequest::Push(CoreLinkPushRequestMessage::Close { pushId: "p".into() }),
     ];
@@ -299,3 +299,6 @@ async fn websocket_final_response_survives_immediate_server_close() {
         }
     }).await.unwrap();
 }
+
+#[path = "host_transports/http_batching.rs"]
+mod http_batching;

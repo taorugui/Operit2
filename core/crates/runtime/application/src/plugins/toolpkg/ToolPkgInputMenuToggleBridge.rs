@@ -136,17 +136,14 @@ impl ToolPkgInputMenuToggleBridge {
     /// Registers input menu hooks for one application runtime.
     pub fn register(runtime: ToolPkgBridgeRuntime) {
         InputMenuTogglePluginRegistry::register(Arc::new(BridgePlugin {
-            runtime: runtime.clone(),
-        }));
-        let manager = runtime.package_manager();
-        manager.addToolPkgRuntimeChangeListener(Arc::new(|activeContainers| {
-            ToolPkgInputMenuToggleBridge::syncToolPkgRegistrations(activeContainers);
+            runtime,
         }));
     }
 
+    /// Synchronizes this bridge from the committed active package catalog.
     #[allow(non_snake_case)]
-    pub fn syncToolPkgRegistrations(activeContainers: Vec<ToolPkgContainerRuntime>) {
-        let mut hooks = activeContainers
+    pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
+        let hooks = activeContainers
             .iter()
             .flat_map(|container| {
                 container.inputMenuTogglePlugins.iter().map(|hook| {
@@ -159,11 +156,6 @@ impl ToolPkgInputMenuToggleBridge {
                 })
             })
             .collect::<Vec<_>>();
-        hooks.sort_by(|left, right| {
-            left.containerPackageName
-                .cmp(&right.containerPackageName)
-                .then(left.pluginId.cmp(&right.pluginId))
-        });
         let mut stored = INPUT_MENU_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()

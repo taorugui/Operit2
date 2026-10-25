@@ -182,12 +182,6 @@ abstract class AppLocalizations {
   /// **'Camera'**
   String get attachmentCamera;
 
-  /// No description provided for @attachmentMemory.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory'**
-  String get attachmentMemory;
-
   /// No description provided for @attachmentFile.
   ///
   /// In en, this message translates to:
@@ -266,12 +260,6 @@ abstract class AppLocalizations {
   /// **'Camera capture is not available in the Flutter client'**
   String get attachmentCameraUnavailable;
 
-  /// No description provided for @attachmentMemoryUnavailable.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory folder selection is not available in the Flutter client'**
-  String get attachmentMemoryUnavailable;
-
   /// No description provided for @clearSearch.
   ///
   /// In en, this message translates to:
@@ -349,24 +337,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Receiving AI response after tool execution...'**
   String get receivingToolResultAiResponse;
-
-  /// No description provided for @roleResponsePlannerPlanning.
-  ///
-  /// In en, this message translates to:
-  /// **'Planning group speaking order...'**
-  String get roleResponsePlannerPlanning;
-
-  /// No description provided for @roleResponsePlannerMemberReplying.
-  ///
-  /// In en, this message translates to:
-  /// **'Generating a reply from \"{memberName}\"...'**
-  String roleResponsePlannerMemberReplying(String memberName);
-
-  /// No description provided for @roleResponsePlannerFailed.
-  ///
-  /// In en, this message translates to:
-  /// **'Group planning failed'**
-  String get roleResponsePlannerFailed;
 
   /// No description provided for @summarizingMemories.
   ///
@@ -517,18 +487,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Always allow in this session'**
   String get toolApprovalAlwaysAllow;
-
-  /// No description provided for @createGroupTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'New group'**
-  String get createGroupTitle;
-
-  /// No description provided for @groupNameLabel.
-  ///
-  /// In en, this message translates to:
-  /// **'Group name'**
-  String get groupNameLabel;
 
   /// No description provided for @renameConversationTitle.
   ///
@@ -1799,7 +1757,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsCategoryLocalModelsSubtitle.
   ///
   /// In en, this message translates to:
-  /// **'Downloads, engines, STT / TTS'**
+  /// **'LLMs, downloads, STT / TTS'**
   String get settingsCategoryLocalModelsSubtitle;
 
   /// No description provided for @settingsCategoryLocalModelsDescription.
@@ -1807,42 +1765,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Manage local models and inference engines installed on demand.'**
   String get settingsCategoryLocalModelsDescription;
-
-  /// No description provided for @settingsCategoryCharactersTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Characters'**
-  String get settingsCategoryCharactersTitle;
-
-  /// No description provided for @settingsCategoryCharactersSubtitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Cards, groups, bindings'**
-  String get settingsCategoryCharactersSubtitle;
-
-  /// No description provided for @settingsCategoryCharactersDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Manage character cards, groups, active roles, and role-level model, memory, and tool bindings.'**
-  String get settingsCategoryCharactersDescription;
-
-  /// No description provided for @settingsCategoryMemoryTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory'**
-  String get settingsCategoryMemoryTitle;
-
-  /// No description provided for @settingsCategoryMemorySubtitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory graph, shared stores, user profile'**
-  String get settingsCategoryMemorySubtitle;
-
-  /// No description provided for @settingsCategoryMemoryDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Manage character and shared memory stores, memory graph visualization, user profiles, and auto-update behavior.'**
-  String get settingsCategoryMemoryDescription;
 
   /// No description provided for @settingsCategoryToolsTitle.
   ///
@@ -1895,7 +1817,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsCategoryGlobalBehaviorDescription.
   ///
   /// In en, this message translates to:
-  /// **'Configure input and interaction behavior that does not vary by character card.'**
+  /// **'Configure application-wide input and interaction behavior.'**
   String get settingsCategoryGlobalBehaviorDescription;
 
   /// No description provided for @settingsCategoryAppearanceTitle.
@@ -1931,7 +1853,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsCategoryDataDescription.
   ///
   /// In en, this message translates to:
-  /// **'Back up chats, characters, and model settings, restore backup content, and view data statistics.'**
+  /// **'Back up chats, plugin data, and model settings, restore backup content, and view data statistics.'**
   String get settingsCategoryDataDescription;
 
   /// No description provided for @settingsCategoryAccessLinksTitle.
@@ -2003,7 +1925,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsComingSoon.
   ///
   /// In en, this message translates to:
-  /// **'This area will continue connecting existing runtime capabilities. Models, characters, and tools are being completed first.'**
+  /// **'This area will continue connecting existing runtime capabilities. Model and tool settings are being completed first.'**
   String get settingsComingSoon;
 
   /// No description provided for @settingsAdvanced.
@@ -2227,12 +2149,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'The TTS configuration currently in use cannot be deleted.'**
   String get settingsTtsCurrentConfigCannotDelete;
-
-  /// No description provided for @settingsTtsConfigUsedByCharacter.
-  ///
-  /// In en, this message translates to:
-  /// **'This TTS configuration is used by a character card and cannot be deleted.'**
-  String get settingsTtsConfigUsedByCharacter;
 
   /// No description provided for @settingsModelChatAutoGlmWarning.
   ///
@@ -2689,12 +2605,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'SiliconFlow'**
   String get settingsModelProviderTypeSiliconflow;
-
-  /// No description provided for @settingsModelProviderTypeIflow.
-  ///
-  /// In en, this message translates to:
-  /// **'iFlow'**
-  String get settingsModelProviderTypeIflow;
 
   /// No description provided for @settingsModelProviderTypeOpenrouter.
   ///
@@ -3572,515 +3482,6 @@ abstract class AppLocalizations {
   /// **'Unknown item'**
   String get settingsModelTestItemUnknown;
 
-  /// No description provided for @settingsCharactersCreateCard.
-  ///
-  /// In en, this message translates to:
-  /// **'New character card'**
-  String get settingsCharactersCreateCard;
-
-  /// No description provided for @settingsCharactersEditCard.
-  ///
-  /// In en, this message translates to:
-  /// **'Edit character card'**
-  String get settingsCharactersEditCard;
-
-  /// No description provided for @settingsCharactersCardName.
-  ///
-  /// In en, this message translates to:
-  /// **'Character name'**
-  String get settingsCharactersCardName;
-
-  /// No description provided for @settingsCharactersCreateGroup.
-  ///
-  /// In en, this message translates to:
-  /// **'New group'**
-  String get settingsCharactersCreateGroup;
-
-  /// No description provided for @settingsCharactersEditGroup.
-  ///
-  /// In en, this message translates to:
-  /// **'Edit group'**
-  String get settingsCharactersEditGroup;
-
-  /// No description provided for @settingsCharactersGroupName.
-  ///
-  /// In en, this message translates to:
-  /// **'Group name'**
-  String get settingsCharactersGroupName;
-
-  /// No description provided for @settingsCharactersDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Description'**
-  String get settingsCharactersDescription;
-
-  /// No description provided for @settingsCharactersCharacterSetting.
-  ///
-  /// In en, this message translates to:
-  /// **'Character setting'**
-  String get settingsCharactersCharacterSetting;
-
-  /// No description provided for @settingsCharactersOpeningStatement.
-  ///
-  /// In en, this message translates to:
-  /// **'Opening statement'**
-  String get settingsCharactersOpeningStatement;
-
-  /// No description provided for @settingsCharactersOtherContentChat.
-  ///
-  /// In en, this message translates to:
-  /// **'Extra chat content'**
-  String get settingsCharactersOtherContentChat;
-
-  /// No description provided for @settingsCharactersOtherContentVoice.
-  ///
-  /// In en, this message translates to:
-  /// **'Extra voice content'**
-  String get settingsCharactersOtherContentVoice;
-
-  /// No description provided for @settingsCharactersAdvancedPrompt.
-  ///
-  /// In en, this message translates to:
-  /// **'Advanced custom prompt'**
-  String get settingsCharactersAdvancedPrompt;
-
-  /// No description provided for @settingsCharactersMarks.
-  ///
-  /// In en, this message translates to:
-  /// **'Notes'**
-  String get settingsCharactersMarks;
-
-  /// No description provided for @settingsCharactersTags.
-  ///
-  /// In en, this message translates to:
-  /// **'Tags'**
-  String get settingsCharactersTags;
-
-  /// No description provided for @settingsCharactersNoTags.
-  ///
-  /// In en, this message translates to:
-  /// **'No tags available. Create one in tag management, then bind it to this character card.'**
-  String get settingsCharactersNoTags;
-
-  /// No description provided for @settingsCharactersImport.
-  ///
-  /// In en, this message translates to:
-  /// **'Import'**
-  String get settingsCharactersImport;
-
-  /// No description provided for @settingsCharactersExport.
-  ///
-  /// In en, this message translates to:
-  /// **'Export'**
-  String get settingsCharactersExport;
-
-  /// No description provided for @settingsCharactersImportJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Import JSON'**
-  String get settingsCharactersImportJson;
-
-  /// No description provided for @settingsCharactersExportJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Export JSON'**
-  String get settingsCharactersExportJson;
-
-  /// No description provided for @settingsCharactersImportTavernJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Import Tavern JSON'**
-  String get settingsCharactersImportTavernJson;
-
-  /// No description provided for @settingsCharactersExportTavernJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Export Tavern JSON'**
-  String get settingsCharactersExportTavernJson;
-
-  /// No description provided for @settingsCharactersImportCardJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Import character card JSON'**
-  String get settingsCharactersImportCardJson;
-
-  /// No description provided for @settingsCharactersImportCardJsonDone.
-  ///
-  /// In en, this message translates to:
-  /// **'Character card imported.'**
-  String get settingsCharactersImportCardJsonDone;
-
-  /// No description provided for @settingsCharactersImportTavernJsonDone.
-  ///
-  /// In en, this message translates to:
-  /// **'Tavern character card imported.'**
-  String get settingsCharactersImportTavernJsonDone;
-
-  /// No description provided for @settingsCharactersImportGroupJson.
-  ///
-  /// In en, this message translates to:
-  /// **'Import group JSON'**
-  String get settingsCharactersImportGroupJson;
-
-  /// No description provided for @settingsCharactersImportGroupJsonDone.
-  ///
-  /// In en, this message translates to:
-  /// **'Group imported.'**
-  String get settingsCharactersImportGroupJsonDone;
-
-  /// No description provided for @settingsCharactersImportJsonError.
-  ///
-  /// In en, this message translates to:
-  /// **'JSON import failed: {error}'**
-  String settingsCharactersImportJsonError(String error);
-
-  /// No description provided for @settingsCharactersImportTavernJsonError.
-  ///
-  /// In en, this message translates to:
-  /// **'Tavern JSON import failed: {error}'**
-  String settingsCharactersImportTavernJsonError(String error);
-
-  /// No description provided for @settingsCharactersExportJsonError.
-  ///
-  /// In en, this message translates to:
-  /// **'JSON export failed: {error}'**
-  String settingsCharactersExportJsonError(String error);
-
-  /// No description provided for @settingsCharactersExportTavernJsonError.
-  ///
-  /// In en, this message translates to:
-  /// **'Tavern JSON export failed: {error}'**
-  String settingsCharactersExportTavernJsonError(String error);
-
-  /// No description provided for @settingsCharactersTagsSection.
-  ///
-  /// In en, this message translates to:
-  /// **'Tags'**
-  String get settingsCharactersTagsSection;
-
-  /// No description provided for @settingsCharactersManageTags.
-  ///
-  /// In en, this message translates to:
-  /// **'Manage tags'**
-  String get settingsCharactersManageTags;
-
-  /// No description provided for @settingsCharactersCreateTag.
-  ///
-  /// In en, this message translates to:
-  /// **'New tag'**
-  String get settingsCharactersCreateTag;
-
-  /// No description provided for @settingsCharactersEditTag.
-  ///
-  /// In en, this message translates to:
-  /// **'Edit tag'**
-  String get settingsCharactersEditTag;
-
-  /// No description provided for @settingsCharactersDeleteTag.
-  ///
-  /// In en, this message translates to:
-  /// **'Delete tag'**
-  String get settingsCharactersDeleteTag;
-
-  /// No description provided for @settingsCharactersDeleteTagMessage.
-  ///
-  /// In en, this message translates to:
-  /// **'Delete “{name}”?'**
-  String settingsCharactersDeleteTagMessage(String name);
-
-  /// No description provided for @settingsCharactersTagName.
-  ///
-  /// In en, this message translates to:
-  /// **'Tag name'**
-  String get settingsCharactersTagName;
-
-  /// No description provided for @settingsCharactersTagDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Tag description'**
-  String get settingsCharactersTagDescription;
-
-  /// No description provided for @settingsCharactersTagPromptContent.
-  ///
-  /// In en, this message translates to:
-  /// **'Prompt content'**
-  String get settingsCharactersTagPromptContent;
-
-  /// No description provided for @settingsCharactersChatModelBindingMode.
-  ///
-  /// In en, this message translates to:
-  /// **'Chat model binding mode'**
-  String get settingsCharactersChatModelBindingMode;
-
-  /// No description provided for @settingsCharactersChatModelConfigId.
-  ///
-  /// In en, this message translates to:
-  /// **'Chat model config ID'**
-  String get settingsCharactersChatModelConfigId;
-
-  /// No description provided for @settingsCharactersChatModelIndex.
-  ///
-  /// In en, this message translates to:
-  /// **'Chat model index'**
-  String get settingsCharactersChatModelIndex;
-
-  /// No description provided for @settingsCharactersToolAccess.
-  ///
-  /// In en, this message translates to:
-  /// **'Tool permission mode'**
-  String get settingsCharactersToolAccess;
-
-  /// No description provided for @settingsCharactersChatModelFollowGlobal.
-  ///
-  /// In en, this message translates to:
-  /// **'Follow global model'**
-  String get settingsCharactersChatModelFollowGlobal;
-
-  /// No description provided for @settingsCharactersChatModelFixedConfig.
-  ///
-  /// In en, this message translates to:
-  /// **'Use fixed model config'**
-  String get settingsCharactersChatModelFixedConfig;
-
-  /// No description provided for @settingsCharactersChatModelConfig.
-  ///
-  /// In en, this message translates to:
-  /// **'Model config'**
-  String get settingsCharactersChatModelConfig;
-
-  /// No description provided for @settingsCharactersToolAccessFollowGlobal.
-  ///
-  /// In en, this message translates to:
-  /// **'Follow global tool permissions'**
-  String get settingsCharactersToolAccessFollowGlobal;
-
-  /// No description provided for @settingsCharactersToolAccessCustom.
-  ///
-  /// In en, this message translates to:
-  /// **'Custom character tool permissions'**
-  String get settingsCharactersToolAccessCustom;
-
-  /// No description provided for @settingsCharactersToolAccessEmpty.
-  ///
-  /// In en, this message translates to:
-  /// **'Enabled with no selected tools'**
-  String get settingsCharactersToolAccessEmpty;
-
-  /// No description provided for @settingsCharactersToolAccessSummaryCounts.
-  ///
-  /// In en, this message translates to:
-  /// **'Built-in {builtinCount} · packages {packageCount} · skills {skillCount} · MCP {mcpCount}'**
-  String settingsCharactersToolAccessSummaryCounts(
-    int builtinCount,
-    int packageCount,
-    int skillCount,
-    int mcpCount,
-  );
-
-  /// No description provided for @settingsCharactersToolAccessConfigure.
-  ///
-  /// In en, this message translates to:
-  /// **'Configure tool allowlist'**
-  String get settingsCharactersToolAccessConfigure;
-
-  /// No description provided for @settingsCharactersToolAccessTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Custom Allowed Tools'**
-  String get settingsCharactersToolAccessTitle;
-
-  /// No description provided for @settingsCharactersToolAccessTabBuiltin.
-  ///
-  /// In en, this message translates to:
-  /// **'Built-ins'**
-  String get settingsCharactersToolAccessTabBuiltin;
-
-  /// No description provided for @settingsCharactersToolAccessTabPackage.
-  ///
-  /// In en, this message translates to:
-  /// **'Packages'**
-  String get settingsCharactersToolAccessTabPackage;
-
-  /// No description provided for @settingsCharactersToolAccessTabSkill.
-  ///
-  /// In en, this message translates to:
-  /// **'Skill'**
-  String get settingsCharactersToolAccessTabSkill;
-
-  /// No description provided for @settingsCharactersToolAccessTabMcp.
-  ///
-  /// In en, this message translates to:
-  /// **'MCP'**
-  String get settingsCharactersToolAccessTabMcp;
-
-  /// No description provided for @settingsCharactersToolAccessSearchPlaceholder.
-  ///
-  /// In en, this message translates to:
-  /// **'Search name, description, or ID'**
-  String get settingsCharactersToolAccessSearchPlaceholder;
-
-  /// No description provided for @settingsCharactersToolAccessEmptySearch.
-  ///
-  /// In en, this message translates to:
-  /// **'No matching tools found'**
-  String get settingsCharactersToolAccessEmptySearch;
-
-  /// No description provided for @settingsCharactersToolAccessRequiresUsePackage.
-  ///
-  /// In en, this message translates to:
-  /// **'Selecting packages, skills, or MCP also requires allowing the built-in use_package tool.'**
-  String get settingsCharactersToolAccessRequiresUsePackage;
-
-  /// No description provided for @settingsCharactersToolAccessEmptyBuiltin.
-  ///
-  /// In en, this message translates to:
-  /// **'No built-in tools are available for configuration'**
-  String get settingsCharactersToolAccessEmptyBuiltin;
-
-  /// No description provided for @settingsCharactersToolAccessEmptyPackages.
-  ///
-  /// In en, this message translates to:
-  /// **'No globally available packages right now'**
-  String get settingsCharactersToolAccessEmptyPackages;
-
-  /// No description provided for @settingsCharactersToolAccessEmptySkills.
-  ///
-  /// In en, this message translates to:
-  /// **'No AI-visible skills are available right now'**
-  String get settingsCharactersToolAccessEmptySkills;
-
-  /// No description provided for @settingsCharactersToolAccessEmptyMcp.
-  ///
-  /// In en, this message translates to:
-  /// **'No enabled MCP servers are available right now'**
-  String get settingsCharactersToolAccessEmptyMcp;
-
-  /// No description provided for @settingsCharactersBuiltinTools.
-  ///
-  /// In en, this message translates to:
-  /// **'Allowed built-in tools'**
-  String get settingsCharactersBuiltinTools;
-
-  /// No description provided for @settingsCharactersAllowedPackages.
-  ///
-  /// In en, this message translates to:
-  /// **'Allowed packages'**
-  String get settingsCharactersAllowedPackages;
-
-  /// No description provided for @settingsCharactersAllowedSkills.
-  ///
-  /// In en, this message translates to:
-  /// **'Allowed skills'**
-  String get settingsCharactersAllowedSkills;
-
-  /// No description provided for @settingsCharactersAllowedMcpServers.
-  ///
-  /// In en, this message translates to:
-  /// **'Allowed MCP servers'**
-  String get settingsCharactersAllowedMcpServers;
-
-  /// No description provided for @settingsCharactersGroupMembersTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Group characters'**
-  String get settingsCharactersGroupMembersTitle;
-
-  /// No description provided for @settingsCharactersOpenMemoryGraph.
-  ///
-  /// In en, this message translates to:
-  /// **'View memory graph'**
-  String get settingsCharactersOpenMemoryGraph;
-
-  /// No description provided for @settingsCharactersMemoryGraphTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'{profileName}\'s memory graph'**
-  String settingsCharactersMemoryGraphTitle(String profileName);
-
-  /// No description provided for @settingsCharactersMemoryGraphEmpty.
-  ///
-  /// In en, this message translates to:
-  /// **'No memory nodes yet'**
-  String get settingsCharactersMemoryGraphEmpty;
-
-  /// No description provided for @settingsCharactersMemoryGraphStats.
-  ///
-  /// In en, this message translates to:
-  /// **'{nodes} nodes · {edges} links'**
-  String settingsCharactersMemoryGraphStats(int nodes, int edges);
-
-  /// No description provided for @settingsCharactersMemoryGraphLink.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory link'**
-  String get settingsCharactersMemoryGraphLink;
-
-  /// No description provided for @settingsCharactersEditUserMarkdown.
-  ///
-  /// In en, this message translates to:
-  /// **'Edit user profile'**
-  String get settingsCharactersEditUserMarkdown;
-
-  /// No description provided for @settingsCharactersUserMarkdownTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'{profileName}\'s user profile'**
-  String settingsCharactersUserMarkdownTitle(String profileName);
-
-  /// No description provided for @settingsCharactersUserMarkdownSaved.
-  ///
-  /// In en, this message translates to:
-  /// **'User profile saved'**
-  String get settingsCharactersUserMarkdownSaved;
-
-  /// No description provided for @settingsCharactersUserMarkdownContent.
-  ///
-  /// In en, this message translates to:
-  /// **'User profile content'**
-  String get settingsCharactersUserMarkdownContent;
-
-  /// No description provided for @settingsCharactersMemoryAutoUpdate.
-  ///
-  /// In en, this message translates to:
-  /// **'Auto-update memory stores'**
-  String get settingsCharactersMemoryAutoUpdate;
-
-  /// No description provided for @settingsCharactersMemoryAutoUpdateDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Allow AI to organize conversation info into memory stores.'**
-  String get settingsCharactersMemoryAutoUpdateDescription;
-
-  /// No description provided for @settingsCharactersPreferenceDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Provide user profile to model'**
-  String get settingsCharactersPreferenceDescription;
-
-  /// No description provided for @settingsCharactersPreferenceDescriptionSubtitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Include the current user profile in chat prompts.'**
-  String get settingsCharactersPreferenceDescriptionSubtitle;
-
-  /// No description provided for @settingsCharactersCardsSection.
-  ///
-  /// In en, this message translates to:
-  /// **'Character cards'**
-  String get settingsCharactersCardsSection;
-
-  /// No description provided for @settingsCharactersGroupsSection.
-  ///
-  /// In en, this message translates to:
-  /// **'Groups'**
-  String get settingsCharactersGroupsSection;
-
-  /// No description provided for @settingsCharactersGroupMembers.
-  ///
-  /// In en, this message translates to:
-  /// **'{count} members'**
-  String settingsCharactersGroupMembers(int count);
-
   /// No description provided for @settingsToolsPermissionMode.
   ///
   /// In en, this message translates to:
@@ -4762,12 +4163,6 @@ abstract class AppLocalizations {
   /// **'ESP32 devices'**
   String get settingsRuntimeDiscoveredEdges;
 
-  /// No description provided for @settingsRuntimeEdgeEndpointTokenRequired.
-  ///
-  /// In en, this message translates to:
-  /// **'Edge endpoint and token are required'**
-  String get settingsRuntimeEdgeEndpointTokenRequired;
-
   /// No description provided for @settingsRuntimeEdgeEndpointRequired.
   ///
   /// In en, this message translates to:
@@ -4792,12 +4187,6 @@ abstract class AppLocalizations {
   /// **'Connection initiated by the other device'**
   String get settingsRuntimeConnectionInitiatedByOtherDevice;
 
-  /// No description provided for @settingsRuntimePairToken.
-  ///
-  /// In en, this message translates to:
-  /// **'Connection token'**
-  String get settingsRuntimePairToken;
-
   /// No description provided for @settingsRuntimePairCode.
   ///
   /// In en, this message translates to:
@@ -4821,6 +4210,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Device address'**
   String get settingsRuntimeBaseUrl;
+
+  /// No description provided for @settingsRuntimeTcpAddressHint.
+  ///
+  /// In en, this message translates to:
+  /// **'host:port, for example 192.168.1.10:37195'**
+  String get settingsRuntimeTcpAddressHint;
+
+  /// No description provided for @settingsRuntimeTransportAuto.
+  ///
+  /// In en, this message translates to:
+  /// **'Auto (recommended)'**
+  String get settingsRuntimeTransportAuto;
+
+  /// No description provided for @settingsRuntimeTransportAutoHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter host:port; the carrier (HTTP/WebSocket/TCP) is detected automatically'**
+  String get settingsRuntimeTransportAutoHint;
 
   /// No description provided for @settingsRuntimeConnectionFailed.
   ///
@@ -4951,7 +4358,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeWebPairDescription.
   ///
   /// In en, this message translates to:
-  /// **'Enter another device\'s address and pairing token to connect this browser as an active pairing client.'**
+  /// **'Enter another device\'s address and confirm the pairing code to connect this browser as an active pairing client.'**
   String get settingsRuntimeWebPairDescription;
 
   /// No description provided for @settingsRuntimeDiscoveredSpaceSummary.
@@ -5233,30 +4640,6 @@ abstract class AppLocalizations {
   /// **'Current mode'**
   String get settingsAppearanceThemeMode;
 
-  /// No description provided for @settingsAppearanceThemeTarget.
-  ///
-  /// In en, this message translates to:
-  /// **'Theme save target'**
-  String get settingsAppearanceThemeTarget;
-
-  /// No description provided for @settingsAppearanceThemeTargetGlobal.
-  ///
-  /// In en, this message translates to:
-  /// **'Global'**
-  String get settingsAppearanceThemeTargetGlobal;
-
-  /// No description provided for @settingsAppearanceThemeTargetCharacter.
-  ///
-  /// In en, this message translates to:
-  /// **'Current character: {name}'**
-  String settingsAppearanceThemeTargetCharacter(Object name);
-
-  /// No description provided for @settingsAppearanceThemeTargetGroup.
-  ///
-  /// In en, this message translates to:
-  /// **'Current group: {name}'**
-  String settingsAppearanceThemeTargetGroup(Object name);
-
   /// No description provided for @settingsAppearanceThemeSystem.
   ///
   /// In en, this message translates to:
@@ -5514,6 +4897,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Mono'**
   String get settingsAppearanceFontMonospace;
+
+  /// No description provided for @settingsAppearanceInterfaceScale.
+  ///
+  /// In en, this message translates to:
+  /// **'Interface scale'**
+  String get settingsAppearanceInterfaceScale;
 
   /// No description provided for @settingsAppearanceFontScale.
   ///
@@ -5809,6 +5198,12 @@ abstract class AppLocalizations {
   /// **'Bubble preview with 9-slice guides'**
   String get settingsAppearanceBubbleImagePreviewText;
 
+  /// No description provided for @settingsAppearanceBubbleImageImportFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Bubble image was not applied: {error}'**
+  String settingsAppearanceBubbleImageImportFailed(String error);
+
   /// No description provided for @settingsAppearanceBubbleImageCrop.
   ///
   /// In en, this message translates to:
@@ -5926,7 +5321,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsAppearanceShowRoleName.
   ///
   /// In en, this message translates to:
-  /// **'Show role name'**
+  /// **'Show custom responder names'**
   String get settingsAppearanceShowRoleName;
 
   /// No description provided for @settingsAppearanceShowUserName.
@@ -6379,12 +5774,6 @@ abstract class AppLocalizations {
   /// **'Title generation'**
   String get settingsDataDetailedStatsSourceTitleGeneration;
 
-  /// No description provided for @settingsDataDetailedStatsSourceMemory.
-  ///
-  /// In en, this message translates to:
-  /// **'Memory analysis'**
-  String get settingsDataDetailedStatsSourceMemory;
-
   /// No description provided for @settingsDataDetailedStatsTotalRequests.
   ///
   /// In en, this message translates to:
@@ -6610,30 +5999,6 @@ abstract class AppLocalizations {
   /// **'Back up all chats and messages. Restore updates or creates chats by chat ID.'**
   String get settingsDataChatHistoriesBackupDescription;
 
-  /// No description provided for @settingsDataCharacterCardsBackup.
-  ///
-  /// In en, this message translates to:
-  /// **'Character card data'**
-  String get settingsDataCharacterCardsBackup;
-
-  /// No description provided for @settingsDataCharacterCardsBackupDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Back up all character cards and referenced tags. Restore updates or creates items by original ID.'**
-  String get settingsDataCharacterCardsBackupDescription;
-
-  /// No description provided for @settingsDataCharacterGroupsBackup.
-  ///
-  /// In en, this message translates to:
-  /// **'Group data'**
-  String get settingsDataCharacterGroupsBackup;
-
-  /// No description provided for @settingsDataCharacterGroupsBackupDescription.
-  ///
-  /// In en, this message translates to:
-  /// **'Back up all groups. Restore keeps member references and ordering.'**
-  String get settingsDataCharacterGroupsBackupDescription;
-
   /// No description provided for @settingsDataModelConfigsBackup.
   ///
   /// In en, this message translates to:
@@ -6707,7 +6072,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsDataExportRawSnapshotDescription.
   ///
   /// In en, this message translates to:
-  /// **'Pack chats, characters, model settings, and local files into one backup file. Restoring replaces current data with the backup.'**
+  /// **'Pack chats, plugin data, model settings, and local files into one backup file. Restoring replaces current data with the backup.'**
   String get settingsDataExportRawSnapshotDescription;
 
   /// No description provided for @settingsDataSnapshotBytes.
@@ -6816,8 +6181,14 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeNetworkControlDescription.
   ///
   /// In en, this message translates to:
-  /// **'Roles, identities, device authority, and audit'**
+  /// **'Manage device identities and permissions, and review activity'**
   String get settingsRuntimeNetworkControlDescription;
+
+  /// No description provided for @settingsRuntimeIdentitiesAndPermissions.
+  ///
+  /// In en, this message translates to:
+  /// **'Identities & permissions'**
+  String get settingsRuntimeIdentitiesAndPermissions;
 
   /// No description provided for @settingsRuntimeControlInitialize.
   ///
@@ -6837,16 +6208,64 @@ abstract class AppLocalizations {
   /// **'Identities'**
   String get settingsRuntimeControlIdentities;
 
+  /// No description provided for @settingsRuntimeControlAuditAccepted.
+  ///
+  /// In en, this message translates to:
+  /// **'Applied'**
+  String get settingsRuntimeControlAuditAccepted;
+
+  /// No description provided for @settingsRuntimeControlAuditRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'Rejected'**
+  String get settingsRuntimeControlAuditRejected;
+
+  /// No description provided for @settingsRuntimeControlAuditIssuer.
+  ///
+  /// In en, this message translates to:
+  /// **'Requested by'**
+  String get settingsRuntimeControlAuditIssuer;
+
+  /// No description provided for @settingsRuntimeControlAuditDetails.
+  ///
+  /// In en, this message translates to:
+  /// **'Technical details'**
+  String get settingsRuntimeControlAuditDetails;
+
+  /// No description provided for @settingsRuntimeControlAuditBootstrap.
+  ///
+  /// In en, this message translates to:
+  /// **'Initialize space permissions'**
+  String get settingsRuntimeControlAuditBootstrap;
+
+  /// No description provided for @settingsRuntimeControlAuditAdmit.
+  ///
+  /// In en, this message translates to:
+  /// **'Admit device'**
+  String get settingsRuntimeControlAuditAdmit;
+
+  /// No description provided for @settingsRuntimeControlAuditMerge.
+  ///
+  /// In en, this message translates to:
+  /// **'Merge device spaces'**
+  String get settingsRuntimeControlAuditMerge;
+
+  /// No description provided for @settingsRuntimeControlAuditPolicy.
+  ///
+  /// In en, this message translates to:
+  /// **'Update permission policy'**
+  String get settingsRuntimeControlAuditPolicy;
+
   /// No description provided for @settingsRuntimeControlAudit.
   ///
   /// In en, this message translates to:
-  /// **'Audit'**
+  /// **'Activity'**
   String get settingsRuntimeControlAudit;
 
   /// No description provided for @settingsRuntimeControlAddRole.
   ///
   /// In en, this message translates to:
-  /// **'Add role'**
+  /// **'New identity'**
   String get settingsRuntimeControlAddRole;
 
   /// No description provided for @settingsRuntimeControlGrantRole.
@@ -6870,13 +6289,13 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlRoleName.
   ///
   /// In en, this message translates to:
-  /// **'Role name'**
+  /// **'Identity name'**
   String get settingsRuntimeControlRoleName;
 
   /// No description provided for @settingsRuntimeControlCapabilities.
   ///
   /// In en, this message translates to:
-  /// **'What can this role do?'**
+  /// **'Actions this identity can perform'**
   String get settingsRuntimeControlCapabilities;
 
   /// No description provided for @settingsRuntimeControlManagedDevices.
@@ -6891,12 +6310,6 @@ abstract class AppLocalizations {
   /// **'Identity name'**
   String get settingsRuntimeControlIdentityName;
 
-  /// No description provided for @settingsRuntimeControlDevice.
-  ///
-  /// In en, this message translates to:
-  /// **'Device'**
-  String get settingsRuntimeControlDevice;
-
   /// No description provided for @settingsRuntimeControlDeviceId.
   ///
   /// In en, this message translates to:
@@ -6906,8 +6319,14 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlNoAudit.
   ///
   /// In en, this message translates to:
-  /// **'No control commands recorded'**
+  /// **'No activity yet. Identity and device changes will appear here.'**
   String get settingsRuntimeControlNoAudit;
+
+  /// No description provided for @settingsRuntimeControlAuditCount.
+  ///
+  /// In en, this message translates to:
+  /// **'{count} records'**
+  String settingsRuntimeControlAuditCount(int count);
 
   /// No description provided for @settingsRuntimeControlNoBindings.
   ///
@@ -6936,7 +6355,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlDisconnectDevice.
   ///
   /// In en, this message translates to:
-  /// **'Disconnect device'**
+  /// **'Isolate device'**
   String get settingsRuntimeControlDisconnectDevice;
 
   /// No description provided for @settingsRuntimeControlRemoved.
@@ -6948,13 +6367,13 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlDisconnected.
   ///
   /// In en, this message translates to:
-  /// **'Disconnected'**
+  /// **'Isolated'**
   String get settingsRuntimeControlDisconnected;
 
   /// No description provided for @settingsRuntimeControlAdmitDevice.
   ///
   /// In en, this message translates to:
-  /// **'Readmit device'**
+  /// **'Lift isolation'**
   String get settingsRuntimeControlAdmitDevice;
 
   /// No description provided for @settingsRuntimeControlAllDevices.
@@ -6969,6 +6388,12 @@ abstract class AppLocalizations {
   /// **'Manages'**
   String get settingsRuntimeControlManages;
 
+  /// No description provided for @settingsRuntimeControlLocalIdentity.
+  ///
+  /// In en, this message translates to:
+  /// **'This device'**
+  String get settingsRuntimeControlLocalIdentity;
+
   /// No description provided for @settingsRuntimeControlCurrentIdentity.
   ///
   /// In en, this message translates to:
@@ -6978,7 +6403,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlCurrentCapabilities.
   ///
   /// In en, this message translates to:
-  /// **'Current capabilities'**
+  /// **'Permissions'**
   String get settingsRuntimeControlCurrentCapabilities;
 
   /// No description provided for @settingsRuntimeControlManageIdentities.
@@ -7002,7 +6427,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlDeviceAdmitted.
   ///
   /// In en, this message translates to:
-  /// **'Connection restriction lifted; waiting for the device to reconnect'**
+  /// **'Isolation lifted; waiting for the device to reconnect'**
   String get settingsRuntimeControlDeviceAdmitted;
 
   /// No description provided for @settingsRuntimeControlIdentityResetDone.
@@ -7014,8 +6439,14 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlIdentityDefinitions.
   ///
   /// In en, this message translates to:
-  /// **'Identity definitions'**
+  /// **'Identity permissions'**
   String get settingsRuntimeControlIdentityDefinitions;
+
+  /// No description provided for @settingsRuntimeControlIdentityCount.
+  ///
+  /// In en, this message translates to:
+  /// **'{count} identities'**
+  String settingsRuntimeControlIdentityCount(int count);
 
   /// No description provided for @settingsRuntimeControlIdentityAssignment.
   ///
@@ -7062,26 +6493,14 @@ abstract class AppLocalizations {
   /// No description provided for @settingsRuntimeControlCapabilityStorageProvide.
   ///
   /// In en, this message translates to:
-  /// **'Provide storage'**
+  /// **'Store shared data replicas'**
   String get settingsRuntimeControlCapabilityStorageProvide;
 
   /// No description provided for @settingsRuntimeControlCapabilityRuntimeExecute.
   ///
   /// In en, this message translates to:
-  /// **'Run tasks'**
+  /// **'Host Core execution'**
   String get settingsRuntimeControlCapabilityRuntimeExecute;
-
-  /// No description provided for @settingsRuntimeControlCapabilityNetworkUser.
-  ///
-  /// In en, this message translates to:
-  /// **'Use the network'**
-  String get settingsRuntimeControlCapabilityNetworkUser;
-
-  /// No description provided for @settingsRuntimeControlCapabilityChatRead.
-  ///
-  /// In en, this message translates to:
-  /// **'Read chat history'**
-  String get settingsRuntimeControlCapabilityChatRead;
 
   /// No description provided for @settingsRuntimeControlCapabilityViewDevices.
   ///
@@ -7107,29 +6526,17 @@ abstract class AppLocalizations {
   /// **'Administrator'**
   String get settingsRuntimeControlRoleAdministrator;
 
-  /// No description provided for @settingsRuntimeControlRoleAuditor.
-  ///
-  /// In en, this message translates to:
-  /// **'Auditor'**
-  String get settingsRuntimeControlRoleAuditor;
-
   /// No description provided for @settingsRuntimeControlRoleRelay.
   ///
   /// In en, this message translates to:
   /// **'Relay node'**
   String get settingsRuntimeControlRoleRelay;
 
-  /// No description provided for @settingsRuntimeControlRoleStorage.
+  /// No description provided for @settingsRuntimeControlRoleEdge.
   ///
   /// In en, this message translates to:
-  /// **'Storage node'**
-  String get settingsRuntimeControlRoleStorage;
-
-  /// No description provided for @settingsRuntimeControlRoleRunner.
-  ///
-  /// In en, this message translates to:
-  /// **'Task runner'**
-  String get settingsRuntimeControlRoleRunner;
+  /// **'Edge node'**
+  String get settingsRuntimeControlRoleEdge;
 
   /// No description provided for @settingsRuntimeControlRoleUser.
   ///
@@ -7191,6 +6598,12 @@ abstract class AppLocalizations {
   /// **'Package'**
   String get pluginLoadingKindPackage;
 
+  /// No description provided for @pluginLoadingKindPlugin.
+  ///
+  /// In en, this message translates to:
+  /// **'Plugin'**
+  String get pluginLoadingKindPlugin;
+
   /// No description provided for @pluginLoadingKindMcp.
   ///
   /// In en, this message translates to:
@@ -7244,6 +6657,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Execution device status unknown'**
   String get chatRouteUnknown;
+
+  /// No description provided for @chatRouteClaimHostPrompt.
+  ///
+  /// In en, this message translates to:
+  /// **'The device host for this chat was not found. Switch it to this device?'**
+  String get chatRouteClaimHostPrompt;
+
+  /// No description provided for @chatRouteClaimHostYes.
+  ///
+  /// In en, this message translates to:
+  /// **'Yes'**
+  String get chatRouteClaimHostYes;
+
+  /// No description provided for @chatRouteClaimHostNo.
+  ///
+  /// In en, this message translates to:
+  /// **'No'**
+  String get chatRouteClaimHostNo;
 
   /// No description provided for @edgePairingCodeTitle.
   ///
@@ -7336,7 +6767,7 @@ abstract class AppLocalizations {
   /// No description provided for @chatMessageRole.
   ///
   /// In en, this message translates to:
-  /// **'Role: {roleName}'**
+  /// **'Responder: {roleName}'**
   String chatMessageRole(String roleName);
 
   /// No description provided for @chatMessageModel.
@@ -7398,42 +6829,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Cache hit rate: {rate}'**
   String chatMessageCacheHitRate(String rate);
-
-  /// No description provided for @settingsPeerToken.
-  ///
-  /// In en, this message translates to:
-  /// **'Connection token'**
-  String get settingsPeerToken;
-
-  /// No description provided for @settingsPeerTokenHelp.
-  ///
-  /// In en, this message translates to:
-  /// **'Remote connections require this token.'**
-  String get settingsPeerTokenHelp;
-
-  /// No description provided for @settingsPeerCopyToken.
-  ///
-  /// In en, this message translates to:
-  /// **'Copy token'**
-  String get settingsPeerCopyToken;
-
-  /// No description provided for @settingsPeerRefreshToken.
-  ///
-  /// In en, this message translates to:
-  /// **'Refresh token'**
-  String get settingsPeerRefreshToken;
-
-  /// No description provided for @settingsPeerTokenCopied.
-  ///
-  /// In en, this message translates to:
-  /// **'Connection token copied.'**
-  String get settingsPeerTokenCopied;
-
-  /// No description provided for @settingsPeerTokenRequired.
-  ///
-  /// In en, this message translates to:
-  /// **'Enter or refresh a connection token.'**
-  String get settingsPeerTokenRequired;
 
   /// No description provided for @settingsPeerPortModeHelp.
   ///
@@ -7723,6 +7118,102 @@ abstract class AppLocalizations {
   /// **'Devices'**
   String get deviceSpaceDevices;
 
+  /// No description provided for @deviceSpaceMemberNotPaired.
+  ///
+  /// In en, this message translates to:
+  /// **'Space member · not paired'**
+  String get deviceSpaceMemberNotPaired;
+
+  /// No description provided for @deviceSpaceMemberPaired.
+  ///
+  /// In en, this message translates to:
+  /// **'Space member · paired'**
+  String get deviceSpaceMemberPaired;
+
+  /// No description provided for @deviceSpacePairedOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'Paired'**
+  String get deviceSpacePairedOnly;
+
+  /// No description provided for @deviceSpaceDirectLink.
+  ///
+  /// In en, this message translates to:
+  /// **'Direct'**
+  String get deviceSpaceDirectLink;
+
+  /// No description provided for @deviceSpaceRelayHops.
+  ///
+  /// In en, this message translates to:
+  /// **'Relayed · {hops} hops'**
+  String deviceSpaceRelayHops(int hops);
+
+  /// No description provided for @deviceSpaceRelayPath.
+  ///
+  /// In en, this message translates to:
+  /// **'Path'**
+  String get deviceSpaceRelayPath;
+
+  /// No description provided for @deviceSpaceLocalDevice.
+  ///
+  /// In en, this message translates to:
+  /// **'This device'**
+  String get deviceSpaceLocalDevice;
+
+  /// No description provided for @deviceSpaceManageDevice.
+  ///
+  /// In en, this message translates to:
+  /// **'Manage device'**
+  String get deviceSpaceManageDevice;
+
+  /// No description provided for @deviceSpaceConnectDirect.
+  ///
+  /// In en, this message translates to:
+  /// **'Connect directly'**
+  String get deviceSpaceConnectDirect;
+
+  /// No description provided for @deviceSpaceConnectDirectHint.
+  ///
+  /// In en, this message translates to:
+  /// **'This device is already a Space member. Pairing it adds a direct link without joining again; pairing shows a six-digit code on the other device for you to enter.'**
+  String get deviceSpaceConnectDirectHint;
+
+  /// No description provided for @deviceSpaceUpdateEndpoint.
+  ///
+  /// In en, this message translates to:
+  /// **'Update direct address'**
+  String get deviceSpaceUpdateEndpoint;
+
+  /// No description provided for @deviceSpaceUpdateEndpointLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Direct address'**
+  String get deviceSpaceUpdateEndpointLabel;
+
+  /// No description provided for @deviceSpaceUpdateEndpointHint.
+  ///
+  /// In en, this message translates to:
+  /// **'For example ws://192.168.1.20:37195/link'**
+  String get deviceSpaceUpdateEndpointHint;
+
+  /// No description provided for @deviceSpaceUpdateEndpointSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Direct address updated'**
+  String get deviceSpaceUpdateEndpointSaved;
+
+  /// No description provided for @deviceSpaceDirectLinkEstablished.
+  ///
+  /// In en, this message translates to:
+  /// **'Direct link established: {device}'**
+  String deviceSpaceDirectLinkEstablished(String device);
+
+  /// No description provided for @deviceSpaceUnpair.
+  ///
+  /// In en, this message translates to:
+  /// **'Unpair device'**
+  String get deviceSpaceUnpair;
+
   /// No description provided for @deviceSpaceMore.
   ///
   /// In en, this message translates to:
@@ -7800,6 +7291,384 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Insert {symbol}'**
   String workspaceInsertSymbol(String symbol);
+
+  /// No description provided for @settingsAppearanceThemeConfig.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme configuration'**
+  String get settingsAppearanceThemeConfig;
+
+  /// No description provided for @settingsAppearanceThemeConfigCustom.
+  ///
+  /// In en, this message translates to:
+  /// **'Unbound appearance'**
+  String get settingsAppearanceThemeConfigCustom;
+
+  /// No description provided for @settingsAppearanceThemeConfigCreate.
+  ///
+  /// In en, this message translates to:
+  /// **'New theme configuration'**
+  String get settingsAppearanceThemeConfigCreate;
+
+  /// No description provided for @settingsAppearanceThemeConfigRename.
+  ///
+  /// In en, this message translates to:
+  /// **'Rename theme configuration'**
+  String get settingsAppearanceThemeConfigRename;
+
+  /// No description provided for @settingsAppearanceThemeConfigDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete an inactive theme configuration'**
+  String get settingsAppearanceThemeConfigDelete;
+
+  /// No description provided for @settingsAppearanceThemeConfigName.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme name'**
+  String get settingsAppearanceThemeConfigName;
+
+  /// No description provided for @settingsAppearanceThemeConfigNameRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter a theme name'**
+  String get settingsAppearanceThemeConfigNameRequired;
+
+  /// No description provided for @settingsAppearanceThemeConfigCustomHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Click + to create and manage independent theme configurations.'**
+  String get settingsAppearanceThemeConfigCustomHint;
+
+  /// No description provided for @settingsAppearanceThemeConfigEditingHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Appearance changes are saved to the selected theme configuration.'**
+  String get settingsAppearanceThemeConfigEditingHint;
+
+  /// No description provided for @settingsAppearanceThemeConfigFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme operation failed: {detail}'**
+  String settingsAppearanceThemeConfigFailed(String detail);
+
+  /// No description provided for @settingsRuntimeControlEditRole.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit role'**
+  String get settingsRuntimeControlEditRole;
+
+  /// No description provided for @settingsRuntimeControlDeleteRole.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete role'**
+  String get settingsRuntimeControlDeleteRole;
+
+  /// No description provided for @settingsRuntimeControlDeleteRoleTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete role {roleName}?'**
+  String settingsRuntimeControlDeleteRoleTitle(String roleName);
+
+  /// No description provided for @settingsRuntimeControlDeleteRoleMessage.
+  ///
+  /// In en, this message translates to:
+  /// **'Devices holding this role fall back to the default user identity.'**
+  String get settingsRuntimeControlDeleteRoleMessage;
+
+  /// No description provided for @settingsAppearanceThemeConfigSource.
+  ///
+  /// In en, this message translates to:
+  /// **'Create from'**
+  String get settingsAppearanceThemeConfigSource;
+
+  /// No description provided for @settingsAppearanceThemeConfigFromDefaults.
+  ///
+  /// In en, this message translates to:
+  /// **'Default appearance'**
+  String get settingsAppearanceThemeConfigFromDefaults;
+
+  /// No description provided for @settingsAppearanceThemeConfigFromCurrent.
+  ///
+  /// In en, this message translates to:
+  /// **'Current appearance'**
+  String get settingsAppearanceThemeConfigFromCurrent;
+
+  /// No description provided for @settingsAppearanceThemeConfigInherit.
+  ///
+  /// In en, this message translates to:
+  /// **'Inherit: {name}'**
+  String settingsAppearanceThemeConfigInherit(String name);
+
+  /// No description provided for @settingsAppearanceThemeConfigFromTemplate.
+  ///
+  /// In en, this message translates to:
+  /// **'Template: {name}'**
+  String settingsAppearanceThemeConfigFromTemplate(String name);
+
+  /// No description provided for @settingsAppearanceThemeConfigDefaultsHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Start with the app defaults'**
+  String get settingsAppearanceThemeConfigDefaultsHint;
+
+  /// No description provided for @settingsAppearanceThemeConfigCurrentHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy your current appearance'**
+  String get settingsAppearanceThemeConfigCurrentHint;
+
+  /// No description provided for @settingsAppearanceThemeConfigSavedSources.
+  ///
+  /// In en, this message translates to:
+  /// **'Inherit a saved configuration'**
+  String get settingsAppearanceThemeConfigSavedSources;
+
+  /// No description provided for @settingsAppearanceThemeConfigPluginSources.
+  ///
+  /// In en, this message translates to:
+  /// **'Use a plugin template'**
+  String get settingsAppearanceThemeConfigPluginSources;
+
+  /// No description provided for @settingsAppearanceThemeConfigSourceHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Templates come from installed plugins. New configurations can be edited independently and use existing appearance sync.'**
+  String get settingsAppearanceThemeConfigSourceHint;
+
+  /// No description provided for @settingsAppearanceLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Unable to load appearance'**
+  String get settingsAppearanceLoadFailed;
+
+  /// No description provided for @settingsAppearanceRepairHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Your saved appearance has not been replaced. Retry after repairing its resources, or reset appearance explicitly. Reset keeps your avatar and saved configurations and selects custom appearance.'**
+  String get settingsAppearanceRepairHint;
+
+  /// No description provided for @settingsAppearanceRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get settingsAppearanceRetry;
+
+  /// No description provided for @settingsAppearanceResetAfterError.
+  ///
+  /// In en, this message translates to:
+  /// **'Reset appearance'**
+  String get settingsAppearanceResetAfterError;
+
+  /// No description provided for @backgroundWorkIdle.
+  ///
+  /// In en, this message translates to:
+  /// **'No work is running'**
+  String get backgroundWorkIdle;
+
+  /// No description provided for @backgroundWorkRunningCount.
+  ///
+  /// In en, this message translates to:
+  /// **'work items running'**
+  String get backgroundWorkRunningCount;
+
+  /// No description provided for @backgroundWorkWaiting.
+  ///
+  /// In en, this message translates to:
+  /// **'Waiting for your confirmation'**
+  String get backgroundWorkWaiting;
+
+  /// No description provided for @backgroundWorkWaitingCount.
+  ///
+  /// In en, this message translates to:
+  /// **'awaiting confirmation'**
+  String get backgroundWorkWaitingCount;
+
+  /// No description provided for @backgroundWorkCompleted.
+  ///
+  /// In en, this message translates to:
+  /// **'Completed'**
+  String get backgroundWorkCompleted;
+
+  /// No description provided for @backgroundWorkFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed — open to view details'**
+  String get backgroundWorkFailed;
+
+  /// No description provided for @backgroundWorkCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'Stopped'**
+  String get backgroundWorkCancelled;
+
+  /// No description provided for @backgroundWorkProcessing.
+  ///
+  /// In en, this message translates to:
+  /// **'Preparing'**
+  String get backgroundWorkProcessing;
+
+  /// No description provided for @backgroundWorkConnecting.
+  ///
+  /// In en, this message translates to:
+  /// **'Connecting'**
+  String get backgroundWorkConnecting;
+
+  /// No description provided for @backgroundWorkReceiving.
+  ///
+  /// In en, this message translates to:
+  /// **'Writing a response'**
+  String get backgroundWorkReceiving;
+
+  /// No description provided for @backgroundWorkTool.
+  ///
+  /// In en, this message translates to:
+  /// **'Running a tool'**
+  String get backgroundWorkTool;
+
+  /// No description provided for @backgroundWorkToolResult.
+  ///
+  /// In en, this message translates to:
+  /// **'Processing tool results'**
+  String get backgroundWorkToolResult;
+
+  /// No description provided for @backgroundWorkSummarizing.
+  ///
+  /// In en, this message translates to:
+  /// **'Organizing context'**
+  String get backgroundWorkSummarizing;
+
+  /// No description provided for @backgroundWorkPlan.
+  ///
+  /// In en, this message translates to:
+  /// **'Executing a plan'**
+  String get backgroundWorkPlan;
+
+  /// No description provided for @backgroundWorkOpen.
+  ///
+  /// In en, this message translates to:
+  /// **'View conversation'**
+  String get backgroundWorkOpen;
+
+  /// No description provided for @backgroundWorkReview.
+  ///
+  /// In en, this message translates to:
+  /// **'Review'**
+  String get backgroundWorkReview;
+
+  /// No description provided for @backgroundWorkStop.
+  ///
+  /// In en, this message translates to:
+  /// **'Stop'**
+  String get backgroundWorkStop;
+
+  /// No description provided for @localModelsDeviceOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'Stored on this device'**
+  String get localModelsDeviceOnly;
+
+  /// No description provided for @localModelsDeviceOnlyDescription.
+  ///
+  /// In en, this message translates to:
+  /// **'Weights, download progress and installation records stay on this device and are excluded from Space sync. Chats can route inference to the device with the model.'**
+  String get localModelsDeviceOnlyDescription;
+
+  /// No description provided for @localModelsRunChat.
+  ///
+  /// In en, this message translates to:
+  /// **'Run and configure'**
+  String get localModelsRunChat;
+
+  /// No description provided for @localModelsUseForChat.
+  ///
+  /// In en, this message translates to:
+  /// **'Use for chat'**
+  String get localModelsUseForChat;
+
+  /// No description provided for @localModelsChatActivated.
+  ///
+  /// In en, this message translates to:
+  /// **'Selected as the chat model'**
+  String get localModelsChatActivated;
+
+  /// No description provided for @localModelsPrompt.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter a prompt'**
+  String get localModelsPrompt;
+
+  /// No description provided for @localModelsGenerate.
+  ///
+  /// In en, this message translates to:
+  /// **'Generate'**
+  String get localModelsGenerate;
+
+  /// No description provided for @localModelsGenerating.
+  ///
+  /// In en, this message translates to:
+  /// **'Generating…'**
+  String get localModelsGenerating;
+
+  /// No description provided for @localModelsThreads.
+  ///
+  /// In en, this message translates to:
+  /// **'CPU threads'**
+  String get localModelsThreads;
+
+  /// No description provided for @localModelsContextSize.
+  ///
+  /// In en, this message translates to:
+  /// **'Context size (tokens)'**
+  String get localModelsContextSize;
+
+  /// No description provided for @localModelsBatchSize.
+  ///
+  /// In en, this message translates to:
+  /// **'Batch size'**
+  String get localModelsBatchSize;
+
+  /// No description provided for @localModelsUnload.
+  ///
+  /// In en, this message translates to:
+  /// **'Unload model'**
+  String get localModelsUnload;
+
+  /// No description provided for @localModelsCpuBackend.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device CPU inference'**
+  String get localModelsCpuBackend;
+
+  /// No description provided for @localModelsLlmDescription.
+  ///
+  /// In en, this message translates to:
+  /// **'Download a GGUF model for llama.cpp or an MNN model bundle. After installation, try it here or select it for chat.'**
+  String get localModelsLlmDescription;
+
+  /// No description provided for @localModelsInvalidSettings.
+  ///
+  /// In en, this message translates to:
+  /// **'Check the thread count, context size and batch size.'**
+  String get localModelsInvalidSettings;
+
+  /// No description provided for @localModelsFilterAll.
+  ///
+  /// In en, this message translates to:
+  /// **'All models'**
+  String get localModelsFilterAll;
+
+  /// No description provided for @localModelsFilterInstalled.
+  ///
+  /// In en, this message translates to:
+  /// **'Installed only'**
+  String get localModelsFilterInstalled;
+
+  /// No description provided for @localModelsSearchCatalog.
+  ///
+  /// In en, this message translates to:
+  /// **'Search by name or inference engine'**
+  String get localModelsSearchCatalog;
 }
 
 class _AppLocalizationsDelegate

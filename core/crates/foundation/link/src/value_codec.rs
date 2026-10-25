@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 type Error = de::value::Error;
 pub(crate) fn to_value(value: impl Serialize) -> Result<CoreValue, Error> {
-    value.serialize(ValueSerializer)
+    crate::codec::captureLinkBuffers(|| value.serialize(ValueSerializer)).0
 }
 pub(crate) fn from_value<T: de::DeserializeOwned>(value: CoreValue) -> Result<T, Error> {
     T::deserialize(value)
@@ -55,7 +55,7 @@ impl Serializer for ValueSerializer {
         self.serialize_str(v.encode_utf8(&mut [0; 4]))
     }
     fn serialize_bytes(self, v: &[u8]) -> Result<CoreValue, Error> {
-        Ok(CoreValue::Bytes(v.to_vec()))
+        Ok(CoreValue::Bytes(crate::CoreBytes::copy_from_slice(v)))
     }
     fn serialize_i128(self, v: i128) -> Result<CoreValue, Error> {
         self.serialize_bytes(&v.to_be_bytes())
@@ -89,7 +89,12 @@ impl Serializer for ValueSerializer {
         v: &T,
     ) -> Result<CoreValue, Error> {
         if name == "_ExtStruct" {
-            return Err(error("MessagePack extensions are not Link values"));
+            let CoreValue::List(parts) = v.serialize(ValueSerializer)? else { return Err(error("Invalid shared buffer extension")); };
+            let [tag, CoreValue::Bytes(reference)] = parts.as_slice() else { return Err(error("Invalid shared buffer extension")); };
+            if !matches!(tag, CoreValue::Signed(0x42) | CoreValue::Unsigned(0x42)) || reference.len() != 24 { return Err(error("Invalid shared buffer extension")); }
+            let number = |offset| usize::try_from(u64::from_be_bytes(reference[offset..offset + 8].try_into().unwrap())).map_err(|_| error("Shared buffer address overflow"));
+            return crate::codec::retain_encoded_buffer(number(0)?, number(8)?, number(16)?)
+                .map(CoreValue::Bytes).map_err(error);
         }
         v.serialize(self)
     }
@@ -298,7 +303,7 @@ impl<'de> Deserializer<'de> for CoreValue {
             CoreValue::Unsigned(v) => visitor.visit_u64(v),
             CoreValue::Float(v) => visitor.visit_f64(v),
             CoreValue::String(v) => visitor.visit_string(v),
-            CoreValue::Bytes(v) => visitor.visit_byte_buf(v),
+            CoreValue::Bytes(v) => visitor.visit_bytes(&v),
             CoreValue::List(v) => {
                 let mut seq = de::value::SeqDeserializer::new(v.into_iter());
                 let result = visitor.visit_seq(&mut seq)?;
@@ -358,7 +363,7 @@ impl<'de> Deserializer<'de> for CoreValue {
             CoreValue::Signed(v) => visitor.visit_i128(v as i128),
             CoreValue::Unsigned(v) => visitor.visit_i128(v as i128),
             CoreValue::Bytes(v) => visitor.visit_i128(i128::from_be_bytes(
-                v.try_into().map_err(|_| error("expected 16 bytes"))?,
+                v.as_ref().try_into().map_err(|_| error("expected 16 bytes"))?,
             )),
             _ => Err(error("expected binary i128")),
         }
@@ -368,7 +373,7 @@ impl<'de> Deserializer<'de> for CoreValue {
             CoreValue::Signed(v) => visitor.visit_u128(v as i128 as u128),
             CoreValue::Unsigned(v) => visitor.visit_u128(v as u128),
             CoreValue::Bytes(v) => visitor.visit_u128(u128::from_be_bytes(
-                v.try_into().map_err(|_| error("expected 16 bytes"))?,
+                v.as_ref().try_into().map_err(|_| error("expected 16 bytes"))?,
             )),
             _ => Err(error("expected binary u128")),
         }
@@ -376,7 +381,7 @@ impl<'de> Deserializer<'de> for CoreValue {
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self {
             CoreValue::Bytes(v) => {
-                let mut seq = de::value::SeqDeserializer::new(v.into_iter());
+                let mut seq = de::value::SeqDeserializer::new(v.iter().copied());
                 let result = visitor.visit_seq(&mut seq)?;
                 seq.end()?;
                 Ok(result)

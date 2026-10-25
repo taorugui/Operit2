@@ -26,6 +26,8 @@ mod markdown;
 mod outgoing_joins;
 #[path = "input/pending_queue.rs"]
 mod pending_queue;
+#[path = "core/peer_discovery.rs"]
+mod peer_discovery;
 #[path = "view/render.rs"]
 mod render;
 #[path = "view/scrollbar.rs"]
@@ -45,7 +47,7 @@ use app::{
 };
 use i18n::TuiLanguage;
 use link_proxy_rs::tui_core;
-use operit_node_runtime::NodeServices::{PairingPrompt, PeerTransport};
+use operit_node_runtime::NodeServices::{DiscoveredPeer, PairingPrompt, PeerTransport};
 use operit_node_runtime::RuntimeRemoteLinkService::{RuntimeRemoteLinkService, SpaceJoinRequest};
 use operit_node_runtime::RuntimePeerService::RuntimePeerService;
 use operit_core_application::CoreApplication;
@@ -69,13 +71,18 @@ use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::{
-    create_cli_core_application_configured_with_toast_host, initialize_shell_chat,
+    create_cli_core_application_configured_with_toast_host,
     parse_shell_args, ShellArgs,
 };
 
 #[derive(Clone, Debug, Default)]
 struct TuiLinkStartupArgs {
-    listen: Option<PeerTransport>,
+    /// Transports requested by `--link-listen`; empty means "apply the saved
+    /// listener config", which is what desktop startup does.
+    listen: Vec<PeerTransport>,
+    /// `--no-listen` keeps this session dial-out only without touching the
+    /// saved listener config.
+    noListen: bool,
     joinNodes: Vec<String>,
 }
 
@@ -86,13 +93,12 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let (shell_args, link_args) = parse_tui_startup_args(args)?;
-    let initial_chat_id_cell = Arc::new(StdMutex::new(None::<String>));
+    // Exactly one process owns an identity's sync worker and listener state.
+    let mut owner = crate::daemon::OwnerGuard::acquire("tui")?;
     let language_cell = Arc::new(StdMutex::new(None::<TuiLanguage>));
     let (toast_sender, toast_receiver) = mpsc::channel::<String>();
-    let toast_host = tui_toast_host(toast_sender);
+    let toast_host = tui_toast_host(toast_sender.clone());
     let (network_event_sender, network_event_receiver) = mpsc::channel::<NetworkUiEvent>();
-    let shell_args_for_core = shell_args.clone();
-    let initial_chat_id_for_core = initial_chat_id_cell.clone();
     let language_for_core = language_cell.clone();
     let core_application = create_cli_core_application_configured_with_toast_host(
         "client",
@@ -102,23 +108,19 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
                 let application = local_core.localApplicationMut();
                 TuiLanguage::from_context(&application.hostManager)?
             };
-            let initial_chat_id =
-                initialize_shell_chat(local_core.localApplicationMut(), &shell_args_for_core)?;
+            let application = local_core.localApplicationMut();
+            let service = EnhancedAIService::new(application.toolHandler.clone(), application.providerRuntimeContext.clone());
+            application.chatRuntimeHolder.try_lock().map_err(|error| error.to_string())?
+                .getCore(ChatRuntimeSlot::MAIN).enhancedAiService = Some(service);
             install_local_permission_requester(local_core);
             *language_for_core
                 .lock()
                 .expect("TUI language cell lock must not be poisoned") = Some(language);
-            *initial_chat_id_for_core
-                .lock()
-                .expect("TUI initial chat cell lock must not be poisoned") = Some(initial_chat_id);
             Ok(())
         },
     )
     .await?;
-    if let Some(transport) = link_args.listen {
-        core_application.accessServices().startListening(vec![transport]).await
-            .map_err(|error| error.to_string())?;
-    }
+    start_tui_listeners(&core_application, &link_args, &toast_sender).await?;
     join_tui_paired_nodes(&core_application, &link_args).await?;
     let language = language_cell
         .lock()
@@ -126,11 +128,22 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         .take()
         .expect("TUI language must be initialized by CoreApplication startup");
     let network_peers = core_application.nodeServices()?.peers();
-    let initial_chat_id = initial_chat_id_cell
-        .lock()
-        .expect("TUI initial chat cell lock must not be poisoned")
-        .take()
-        .expect("TUI initial chat must be initialized by CoreApplication startup");
+    // Await plugin lifecycle initialization only after Core startup has scheduled registry loading.
+    let mut core = tui_core(core_application.localClient());
+    let existing_chat_id = if let Some(chat_id) = &shell_args.chatId { Some(chat_id.clone()) }
+        else if shell_args.resume {
+            let chats = core.chat_runtime_holder_main().chatHistoriesFlowSnapshot().await.map_err(|error| error.to_string())?;
+            Some(chats.into_iter().max_by_key(|chat| chat.updatedAt.parse::<i64>().unwrap_or(0))
+                .ok_or_else(|| "no previous chat to resume".to_string())?.id)
+        } else { None };
+    let command = match existing_chat_id {
+        Some(chat_id) => vec!["chat".to_string(), "switch".to_string(), chat_id, "--json".to_string()],
+        None => shell_args.new_chat_command_args(),
+    };
+    let output = core.runCoreCommand(&command).await.map_err(|error| error.to_string())?;
+    let result: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| error.to_string())?;
+    let initial_chat_id = result.get("chatId").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "chat initialization did not return a chatId".to_string())?.to_string();
     let startup_install_prompt = build_startup_install_prompt()?;
     let startup_update_prompt =
         build_startup_update_prompt(shell_args.updateCurrentVersion.as_deref()).await?;
@@ -145,7 +158,7 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         None
     };
     let mut tui = OperitTui::new(
-        tui_core(core_application.localClient()),
+        core,
         core_application.accessServices(),
         shell_args,
         initial_chat_id,
@@ -155,32 +168,43 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
         startup_workspace_prompt_path,
         toast_receiver,
         network_event_receiver,
+        network_event_sender.clone(),
     )
     .await?;
-    // Runtime peer/proxy futures are not Send. Keep the monitor on the local
-    // executor, independently of the terminal loop, and drop its in-flight
-    // operations before shutting down the Core.
+    let access_services = core_application.accessServices();
+    // The host control channel lets `operit2 cli ...` reuse this Core instead of
+    // booting a second owner for the same identity.
+    owner.refresh_log_path()?;
+    let control_server =
+        crate::daemon::ControlServer::bind(&mut owner, core_application.localClient())?;
+    // Runtime peer/proxy futures are not Send. Keep the monitor and the
+    // control server on the local executor, independently of the terminal
+    // loop, and drop their in-flight operations before shutting down the Core.
     let result = tokio::task::LocalSet::new()
-        .run_until(async {
+        .run_until(async move {
+            let control_task = control_server.spawn_local();
             let network_event_task = spawn_network_ui_events(
                 network_peers,
-                core_application.accessServices(),
+                access_services.clone(),
                 network_event_sender.clone(),
             );
             let outgoing_join_task = outgoing_joins::spawn_outgoing_join_monitor(
-                core_application.accessServices(),
+                access_services,
                 network_event_sender,
             );
             let result = tui.run().await;
+            control_task.abort();
             outgoing_join_task.abort();
             network_event_task.abort();
+            let _ = control_task.await;
             let _ = outgoing_join_task.await;
             let _ = network_event_task.await;
+            drop(tui);
             result
         })
         .await;
-    drop(tui);
     core_application.shutdown().await;
+    drop(owner);
     result
 }
 
@@ -194,6 +218,8 @@ pub(crate) enum NetworkUiEvent {
         prompts: Vec<PairingPrompt>,
         requests: Option<Vec<SpaceJoinRequest>>,
     },
+    /// A background LAN scan finished; the candidate list opens on the loop.
+    DiscoveryFinished(Result<Vec<DiscoveredPeer>, String>),
 }
 
 /// Fetches change-triggered snapshots off the terminal loop. Peer futures are
@@ -235,7 +261,7 @@ fn tui_toast_host(sender: mpsc::Sender<String>) -> Arc<dyn operit_host_api::Toas
 /// Returns the TUI startup usage text, shared by `tui --help` and argument
 /// parsing errors.
 fn tui_usage_text() -> &'static str {
-    "usage: operit2 tui [--link-listen <http|ws|tcp|serial|bluetooth>] [--link-join <node-id>] [--chat <chat-id>] [--resume] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>] [--update-current-version <version>]"
+    "usage: operit2 tui [--link-listen <http|ws|tcp|serial|bluetooth>[,<transport>...]] [--no-listen] [--link-join <node-id>] [--chat <chat-id>] [--resume] [--source <chat-id>] [--input <json-object>] [--update-current-version <version>]"
 }
 
 /// Splits TUI Link startup arguments from normal shell startup arguments.
@@ -248,11 +274,18 @@ fn parse_tui_startup_args(args: &[String]) -> Result<(ShellArgs, TuiLinkStartupA
         match args[index].as_str() {
             "--link-listen" => {
                 index += 1;
-                link_args.listen = Some(
-                    parse_peer_transport(args.get(index).map(String::as_str).unwrap_or_default())
-                        .map_err(|_| usage.to_string())?,
-                );
+                let value = args.get(index).ok_or_else(|| usage.to_string())?;
+                // A comma-separated list matches the `link listen` spelling, so
+                // one flag can replace the whole exposed transport set.
+                for spelling in value.split(',') {
+                    let transport =
+                        parse_peer_transport(spelling.trim()).map_err(|_| usage.to_string())?;
+                    if !link_args.listen.contains(&transport) {
+                        link_args.listen.push(transport);
+                    }
+                }
             }
+            "--no-listen" => link_args.noListen = true,
             "--link-join" => {
                 index += 1;
                 link_args
@@ -263,8 +296,71 @@ fn parse_tui_startup_args(args: &[String]) -> Result<(ShellArgs, TuiLinkStartupA
         }
         index += 1;
     }
+    if link_args.noListen && !link_args.listen.is_empty() {
+        return Err(usage.to_string());
+    }
     let shell_args = parse_shell_args(&shell_arg_tokens).map_err(|_| usage.to_string())?;
     Ok((shell_args, link_args))
+}
+
+/// Starts inbound listeners the way desktop startup does: the saved listener
+/// config applies on every launch, and `--link-listen` replaces it before
+/// starting. Only the explicit flag can fail the launch; automatic startup
+/// degrades to a status warning so a busy port or a second instance never
+/// blocks the terminal. `--no-listen` keeps the session dial-out only.
+async fn start_tui_listeners(
+    core_application: &CoreApplication,
+    link_args: &TuiLinkStartupArgs,
+    toast_sender: &mpsc::Sender<String>,
+) -> Result<(), String> {
+    if link_args.noListen {
+        return Ok(());
+    }
+    let services = core_application.accessServices();
+    let explicit = !link_args.listen.is_empty();
+    let transports = if explicit {
+        let mut config = crate::cli::link::cli_listener_config(&services)?;
+        config.transports = link_args.listen.clone();
+        config.updatedAt = operit_host_api::TimeUtils::currentTimeMillis();
+        services.saveLocalHostConfig(config)?;
+        link_args.listen.clone()
+    } else {
+        let Some(config) = services.localHostConfig()? else {
+            return Ok(());
+        };
+        let capabilities = services.listenerCapabilities()?;
+        saved_listener_transports(&config.transports, &capabilities.transports)
+    };
+    if transports.is_empty() {
+        return Ok(());
+    }
+    match services.startListening(transports).await {
+        Ok(()) => Ok(()),
+        Err(error) if explicit => Err(error),
+        Err(error) => {
+            AppLogger::w(
+                "TuiListener",
+                &format!("automatic listener start failed: {error}"),
+            );
+            let _ = toast_sender.send(format!("listener start failed: {error}"));
+            Ok(())
+        }
+    }
+}
+
+/// Keeps saved transports this Host can actually open, in saved order and
+/// without duplicates; unsupported spellings are dropped like desktop startup.
+fn saved_listener_transports(
+    saved: &[PeerTransport],
+    supported: &[PeerTransport],
+) -> Vec<PeerTransport> {
+    let mut transports = Vec::new();
+    for transport in saved {
+        if supported.contains(transport) && !transports.contains(transport) {
+            transports.push(*transport);
+        }
+    }
+    transports
 }
 
 /// Joins configured paired device spaces inside the TUI Core process.
@@ -394,5 +490,77 @@ fn tool_to_permission_payload(tool: &AITool) -> RuntimeHostInteractionToolPermis
                 },
             )
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_listen_takes_a_comma_separated_transport_list() {
+        let (shell_args, link_args) = parse_tui_startup_args(&[
+            "--link-listen".to_string(),
+            "http, ws".to_string(),
+            "--resume".to_string(),
+        ])
+        .expect("comma-separated transports must parse");
+        assert_eq!(
+            link_args.listen,
+            vec![PeerTransport::Http, PeerTransport::WebSocket]
+        );
+        assert!(!link_args.noListen);
+        assert!(link_args.joinNodes.is_empty());
+        assert!(shell_args.resume);
+    }
+
+    #[test]
+    fn link_listen_without_a_value_and_unknown_transports_are_usage_errors() {
+        assert_eq!(
+            parse_tui_startup_args(&["--link-listen".to_string()]).unwrap_err(),
+            tui_usage_text()
+        );
+        assert_eq!(
+            parse_tui_startup_args(&["--link-listen".to_string(), "carrier-pigeon".to_string()])
+                .unwrap_err(),
+            tui_usage_text()
+        );
+    }
+
+    #[test]
+    fn no_listen_conflicts_with_an_explicit_transport() {
+        let (_, link_args) = parse_tui_startup_args(&["--no-listen".to_string()])
+            .expect("--no-listen alone must parse");
+        assert!(link_args.listen.is_empty());
+        assert!(link_args.noListen);
+        assert_eq!(
+            parse_tui_startup_args(&[
+                "--link-listen".to_string(),
+                "tcp".to_string(),
+                "--no-listen".to_string(),
+            ])
+            .unwrap_err(),
+            tui_usage_text()
+        );
+    }
+
+    #[test]
+    fn saved_transports_keep_saved_order_and_drop_unsupported() {
+        let saved = [
+            PeerTransport::Tcp,
+            PeerTransport::Bluetooth,
+            PeerTransport::Http,
+            PeerTransport::Tcp,
+        ];
+        let supported = [
+            PeerTransport::Http,
+            PeerTransport::WebSocket,
+            PeerTransport::Tcp,
+        ];
+        assert_eq!(
+            saved_listener_transports(&saved, &supported),
+            vec![PeerTransport::Tcp, PeerTransport::Http]
+        );
+        assert!(saved_listener_transports(&[], &supported).is_empty());
     }
 }

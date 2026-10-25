@@ -1,8 +1,6 @@
-use crate::chat::hooks::ActivePromptHookMetadata::build_active_prompt_hook_metadata;
 use crate::chat::hooks::PromptHookRegistry::{PromptHookContext, PromptHookRegistry};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Preprocesses user input before it enters the chat pipeline.
 pub struct InputProcessor;
@@ -12,23 +10,19 @@ pub struct InputProcessor;
 pub struct ProcessUserInputRequest {
     pub input: String,
     pub chat_id: Option<String>,
-    pub role_card_id: Option<String>,
-    /// Host callback used to surface a timed-out Prompt Input Hook.
-    pub on_hook_timeout: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub participant_id: Option<String>,
 }
 
 impl InputProcessor {
     /// Applies input preprocessing hooks for one chat request.
-    pub async fn process_user_input(request: ProcessUserInputRequest) -> String {
-        let active_prompt_metadata = build_active_prompt_hook_metadata(
-            request.chat_id.as_deref(),
-            request.role_card_id.as_deref(),
-        );
-        let mut metadata = HashMap::<String, Value>::new();
-        metadata.insert(
-            "activePrompt".to_string(),
-            Value::Object(active_prompt_metadata.to_value_map()),
-        );
+    pub async fn process_user_input(request: ProcessUserInputRequest) -> Result<String, String> {
+        let metadata = HashMap::<String, Value>::from([(
+            "executionContext".to_string(),
+            serde_json::json!({
+                "chatId": request.chat_id,
+                "participantId": request.participant_id,
+            }),
+        )]);
 
         let before_context = PromptHookRegistry::dispatchPromptInputHooks(PromptHookContext {
             stage: "before_process".to_string(),
@@ -36,10 +30,9 @@ impl InputProcessor {
             raw_input: Some(request.input.clone()),
             processed_input: Some(request.input.clone()),
             metadata,
-            on_hook_timeout: request.on_hook_timeout.clone(),
             ..PromptHookContext::default()
         })
-        .await;
+        .await?;
 
         let processed_input = before_context
             .processed_input
@@ -55,8 +48,8 @@ impl InputProcessor {
             metadata: before_context.metadata.clone(),
             ..before_context
         })
-        .await;
+        .await?;
 
-        after_context.processed_input.unwrap_or(processed_input)
+        Ok(after_context.processed_input.unwrap_or(processed_input))
     }
 }

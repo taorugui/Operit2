@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::CoreNodeIdentityStore::CoreNodeIdentityStore;
-use crate::PreferencesDataStore::{emptyPreferences, stringPreferencesKey, CoreNodeStateStore, PreferencesDataStore};
+use crate::PreferencesDataStore::{emptyPreferences, stringPreferencesKey, CoreNodeStateStore, Preferences, PreferencesDataStore, PreferencesDataStoreError, PreferencesSyncedEntry};
 use crate::RuntimeStorageHost::defaultRuntimeStorageHost;
 
 const CORE_SPACE_RECORD_KEY: &str = "record";
+const CORE_SPACE_RECORD_VERSION: u32 = 3;
 const UNMEASURED_DIRECT_PEER_COST: u64 = 1_000_000_000;
+/// Identifies adjacency announcements that carry no measured link quality yet.
+const LOCAL_DIRECT_PEER_EPOCH: &str = "direct-adjacency";
 
 /// Describes the converged Space membership visible to one CoreNode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +39,13 @@ pub struct CoreSpaceDeviceProfile {
     pub model: String,
     #[serde(default)]
     pub coreVersion: Option<String>,
+    /// The pairing generation this device announced while admitted. A removal
+    /// revokes exactly this generation: only pairings stamped with it are
+    /// forgotten, while a pairing the device made after leaving and resetting
+    /// (its next generation) survives. Absent on profiles from older cores,
+    /// whose removal semantics stay unchanged.
+    #[serde(default)]
+    pub pairingIncarnation: Option<String>,
     pub updatedAt: i64,
 }
 
@@ -65,7 +75,6 @@ pub struct CoreSpaceDevicePresence {
     pub nodeId: String,
     pub active: bool,
     pub baseUrl: String,
-    pub tokenHash: String,
     pub version: String,
     pub updatedAt: i64,
 }
@@ -79,6 +88,27 @@ struct CoreSpaceMemberRecord {
     nodeId: String,
     joinedAt: i64,
     updatedAt: i64,
+}
+
+/// Describes one resolved route plan from this CoreNode to a Space member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreSpaceRoutePlan {
+    /// Hop node ids from the resolved first hop through the target, inclusive.
+    pub path: Vec<String>,
+}
+
+impl CoreSpaceRoutePlan {
+    /// Returns the only hop this device may forward one request to directly.
+    #[allow(non_snake_case)]
+    pub fn firstHop(&self) -> &str {
+        self.path.first().map(|hop| hop.as_str()).unwrap_or_default()
+    }
+
+    /// Returns how many Peer Links one request traverses along this plan.
+    #[allow(non_snake_case)]
+    pub fn hops(&self) -> u32 {
+        u32::try_from(self.path.len()).unwrap_or(u32::MAX)
+    }
 }
 
 /// Stores the directly paired peers announced by one CoreNode.
@@ -471,6 +501,7 @@ impl CoreSpaceStore {
             platform,
             model,
             coreVersion: Some(coreVersion),
+            pairingIncarnation: None,
             updatedAt: currentTimeMillis(),
         };
         self.writeDeviceProfile(&profile)?;
@@ -501,6 +532,7 @@ impl CoreSpaceStore {
         platform: String,
         model: String,
         coreVersion: String,
+        pairingIncarnation: Option<String>,
     ) -> Result<CoreSpaceDeviceProfile, String> {
         validateDeviceProfileField("display name", &displayName)?;
         validateDeviceProfileField("platform", &platform)?;
@@ -521,7 +553,8 @@ impl CoreSpaceStore {
                 if profile.displayName == displayName
                     && profile.platform == platform
                     && profile.model == model
-                    && profile.coreVersion.as_deref() == Some(coreVersion.as_str()) =>
+                    && profile.coreVersion.as_deref() == Some(coreVersion.as_str())
+                    && profile.pairingIncarnation == pairingIncarnation =>
             {
                 return Ok(profile.clone());
             }
@@ -532,6 +565,7 @@ impl CoreSpaceStore {
                 platform,
                 model,
                 coreVersion: Some(coreVersion),
+                pairingIncarnation,
                 updatedAt: currentTimeMillis(),
             },
             None => CoreSpaceDeviceProfile {
@@ -541,6 +575,7 @@ impl CoreSpaceStore {
                 platform,
                 model,
                 coreVersion: Some(coreVersion),
+                pairingIncarnation,
                 updatedAt: currentTimeMillis(),
             },
         };
@@ -582,14 +617,14 @@ impl CoreSpaceStore {
                 continue;
             }
             let preferences =
-                PreferencesDataStore::newWithStorage(self.storage.clone(), entry.path.clone())
+                self.recordStore(entry.path.clone())
                     .data()
                     .map_err(|error| error.to_string())?;
             let encoded = preferences
                 .get(&stringPreferencesKey(CORE_SPACE_RECORD_KEY))
                 .ok_or_else(|| format!("Device space profile record is empty: {}", entry.path))?;
             let profile: CoreSpaceDeviceProfile =
-                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                serde_json::from_value(encoded.clone()).map_err(|error| error.to_string())?;
             validateDeviceProfile(&profile)?;
             profiles.insert(profile.nodeId.clone(), profile);
         }
@@ -652,7 +687,6 @@ impl CoreSpaceStore {
         &self,
         active: bool,
         baseUrl: String,
-        tokenHash: String,
         version: String,
     ) -> Result<CoreSpaceDevicePresence, String> {
         let identity = CoreNodeIdentityStore::new(self.storage.clone()).initialize()?;
@@ -660,7 +694,6 @@ impl CoreSpaceStore {
             nodeId: identity.nodeId,
             active,
             baseUrl,
-            tokenHash,
             version,
             updatedAt: currentTimeMillis(),
         };
@@ -690,14 +723,14 @@ impl CoreSpaceStore {
                 continue;
             }
             let preferences =
-                PreferencesDataStore::newWithStorage(self.storage.clone(), entry.path.clone())
+                self.recordStore(entry.path.clone())
                     .data()
                     .map_err(|error| error.to_string())?;
             let encoded = preferences
                 .get(&stringPreferencesKey(CORE_SPACE_RECORD_KEY))
                 .ok_or_else(|| format!("Device space presence record is empty: {}", entry.path))?;
             let presence: CoreSpaceDevicePresence =
-                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                serde_json::from_value(encoded.clone()).map_err(|error| error.to_string())?;
             validateDevicePresence(&presence)?;
             presences.insert(presence.nodeId.clone(), presence);
         }
@@ -767,6 +800,93 @@ impl CoreSpaceStore {
         })
     }
 
+    /// Publishes the local adjacency announcement for one live direct-peer set.
+    ///
+    /// Peers are replaced with the supplied set - the owning device is the only writer of
+    /// its own record - and every peer without a still-fresh advertisement receives one
+    /// carrying no measured quality yet, so route selection stays at hop count. Returns
+    /// whether the local record changed.
+    #[allow(non_snake_case)]
+    pub fn publishLocalAdjacency(
+        &self,
+        directPeerNodeIds: Vec<String>,
+        linkTtlMs: i64,
+        refreshMarginMs: i64,
+    ) -> Result<bool, String> {
+        if linkTtlMs <= 0 || refreshMarginMs < 0 || refreshMarginMs >= linkTtlMs {
+            return Err("Device space adjacency lifetimes are invalid".to_string());
+        }
+        let identity = CoreNodeIdentityStore::new(self.storage.clone()).initialize()?;
+        let mut peerSet = BTreeSet::new();
+        for peerNodeId in directPeerNodeIds {
+            validateNodeId(&peerNodeId)?;
+            if peerNodeId == identity.nodeId {
+                return Err("A device cannot register itself as a direct peer".to_string());
+            }
+            peerSet.insert(peerNodeId);
+        }
+        let peers = peerSet.into_iter().collect::<Vec<_>>();
+        let now = currentTimeMillis();
+        let current = self.topologyRecords()?.remove(&identity.nodeId);
+        let mut links = current
+            .as_ref()
+            .map(|record| {
+                record
+                    .links
+                    .iter()
+                    .filter(|link| {
+                        peers.contains(&link.targetNodeId)
+                            && link.expiresAt.saturating_sub(now) > refreshMarginMs
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let retainedTargets = links
+            .iter()
+            .map(|link| link.targetNodeId.clone())
+            .collect::<BTreeSet<_>>();
+        let mut additions = 0_usize;
+        for peerNodeId in peers.iter().filter(|peer| !retainedTargets.contains(*peer)) {
+            let sequence = current
+                .as_ref()
+                .and_then(|record| {
+                    record
+                        .links
+                        .iter()
+                        .find(|link| link.targetNodeId == *peerNodeId)
+                })
+                .map(|link| link.sequence.saturating_add(1))
+                .unwrap_or(1);
+            links.push(CoreSpaceLinkAdvertisement {
+                targetNodeId: peerNodeId.clone(),
+                channelEpoch: LOCAL_DIRECT_PEER_EPOCH.to_string(),
+                sequence,
+                measuredAt: now,
+                expiresAt: now.saturating_add(linkTtlMs),
+                smoothedRttMs: 0,
+                lossPermille: 0,
+                congestionPermille: 0,
+            });
+            additions += 1;
+        }
+        let peersUnchanged = current
+            .as_ref()
+            .map(|record| record.peers.as_slice() == peers.as_slice())
+            .unwrap_or(false);
+        if peersUnchanged && additions == 0 {
+            return Ok(false);
+        }
+        links.sort_by(|left, right| left.targetNodeId.cmp(&right.targetNodeId));
+        self.writeTopologyRecord(&CoreSpaceTopologyRecord {
+            nodeId: identity.nodeId,
+            peers,
+            links,
+            updatedAt: now,
+        })?;
+        Ok(true)
+    }
+
     /// Returns every directed direct-device connection inside the current device space.
     #[allow(non_snake_case)]
     pub fn deviceConnections(&self) -> Result<Vec<CoreSpaceDeviceConnection>, String> {
@@ -794,6 +914,21 @@ impl CoreSpaceStore {
         Ok(connections.into_iter().collect())
     }
 
+    /// Resolves a multi-hop route plan using every current member as a potential relay.
+    #[allow(non_snake_case)]
+    pub fn routePlanThroughPeers(
+        &self,
+        targetNodeId: String,
+        directPeerNodeIds: BTreeSet<String>,
+    ) -> Result<Option<CoreSpaceRoutePlan>, String> {
+        let transitNodeIds = self.space()?.members.into_iter().collect();
+        self.routePlanThroughPeersWithTransitNodes(
+            targetNodeId,
+            directPeerNodeIds,
+            transitNodeIds,
+        )
+    }
+
     /// Resolves an active first hop with Dijkstra over non-expired directed link measurements.
     #[allow(non_snake_case)]
     pub fn reachableNextHopThroughPeers(
@@ -809,14 +944,16 @@ impl CoreSpaceStore {
         )
     }
 
-    /// Resolves a weighted first hop while allowing only selected members to forward a later hop.
+    /// Resolves one weighted route plan while allowing only selected members to forward a
+    /// later hop. The plan lists the hops from the resolved first hop through the target;
+    /// only the first hop is one this device may forward a request to directly.
     #[allow(non_snake_case)]
-    pub fn reachableNextHopThroughPeersWithTransitNodes(
+    pub fn routePlanThroughPeersWithTransitNodes(
         &self,
         targetNodeId: String,
         directPeerNodeIds: BTreeSet<String>,
         transitNodeIds: BTreeSet<String>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CoreSpaceRoutePlan>, String> {
         validateNodeId(&targetNodeId)?;
         let identity = CoreNodeIdentityStore::new(self.storage.clone()).initialize()?;
         if identity.nodeId == targetNodeId {
@@ -832,6 +969,9 @@ impl CoreSpaceStore {
         let now = currentTimeMillis();
         let mut distances = BTreeMap::<String, u64>::new();
         let mut firstHops = BTreeMap::<String, String>::new();
+        // Records which hop first expanded a later hop so one plan can be rebuilt from the
+        // search. Direct peers and the local device itself carry no predecessor.
+        let mut predecessor = BTreeMap::<String, String>::new();
         let mut settled = BTreeSet::<String>::new();
         distances.insert(identity.nodeId.clone(), 0);
         let localTopology = topology.get(&identity.nodeId);
@@ -876,7 +1016,12 @@ impl CoreSpaceStore {
                 return Ok(None);
             };
             if nodeId == targetNodeId {
-                return Ok(firstHops.get(&nodeId).cloned());
+                let Some(firstHop) = firstHops.get(&nodeId).cloned() else {
+                    return Ok(None);
+                };
+                return Ok(Some(CoreSpaceRoutePlan {
+                    path: routePlanPath(&firstHop, &nodeId, &predecessor),
+                }));
             }
             settled.insert(nodeId.clone());
             if nodeId != identity.nodeId && !transitNodeIds.contains(&nodeId) {
@@ -913,11 +1058,33 @@ impl CoreSpaceStore {
                     _ => true,
                 };
                 if replace {
+                    if nodeId == identity.nodeId {
+                        predecessor.remove(&link.targetNodeId);
+                    } else {
+                        predecessor.insert(link.targetNodeId.clone(), nodeId.clone());
+                    }
                     distances.insert(link.targetNodeId.clone(), candidateCost);
                     firstHops.insert(link.targetNodeId.clone(), candidateFirstHop);
                 }
             }
         }
+    }
+
+    /// Resolves a weighted first hop while allowing only selected members to forward a later hop.
+    #[allow(non_snake_case)]
+    pub fn reachableNextHopThroughPeersWithTransitNodes(
+        &self,
+        targetNodeId: String,
+        directPeerNodeIds: BTreeSet<String>,
+        transitNodeIds: BTreeSet<String>,
+    ) -> Result<Option<String>, String> {
+        Ok(self
+            .routePlanThroughPeersWithTransitNodes(
+                targetNodeId,
+                directPeerNodeIds,
+                transitNodeIds,
+            )?
+            .map(|plan| plan.firstHop().to_string()))
     }
 
     /// Reads every synchronized member record stored by this CoreNode.
@@ -931,15 +1098,20 @@ impl CoreSpaceStore {
             if entry.isDirectory {
                 continue;
             }
+            // The atomic writer stages private dot-prefixed siblings; a killed
+            // process leaves them behind and they are never member records.
+            if entry.path.rsplit('/').next().is_some_and(|name| name.starts_with('.')) {
+                continue;
+            }
             let preferences =
-                PreferencesDataStore::newWithStorage(self.storage.clone(), entry.path.clone())
+                self.recordStore(entry.path.clone())
                     .data()
                     .map_err(|error| error.to_string())?;
             let encoded = preferences
                 .get(&stringPreferencesKey(CORE_SPACE_RECORD_KEY))
                 .ok_or_else(|| format!("Device space member record is empty: {}", entry.path))?;
             let record: CoreSpaceMemberRecord =
-                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                serde_json::from_value(encoded.clone()).map_err(|error| error.to_string())?;
             validateMemberRecord(&record)?;
             records.insert(record.nodeId.clone(), record);
         }
@@ -952,7 +1124,7 @@ impl CoreSpaceStore {
         let mut preferences = emptyPreferences();
         preferences.set(
             &stringPreferencesKey(CORE_SPACE_RECORD_KEY),
-            serde_json::to_string(record).map_err(|error| error.to_string())?,
+            serde_json::to_value(record).map_err(|error| error.to_string())?,
         );
         self.syncedMemberStore(&record.nodeId)
             .replaceRecoverably(preferences)
@@ -1030,7 +1202,7 @@ impl CoreSpaceStore {
                 continue;
             }
             let preferences =
-                PreferencesDataStore::newWithStorage(self.storage.clone(), entry.path.clone())
+                self.recordStore(entry.path.clone())
                     .data()
                     .map_err(|error| error.to_string())?;
             let encoded = preferences
@@ -1039,7 +1211,7 @@ impl CoreSpaceStore {
                     format!("Device space connection record is empty: {}", entry.path)
                 })?;
             let record: CoreSpaceTopologyRecord =
-                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                serde_json::from_value(encoded.clone()).map_err(|error| error.to_string())?;
             validateTopologyRecord(&record)?;
             records.insert(record.nodeId.clone(), record);
         }
@@ -1052,7 +1224,7 @@ impl CoreSpaceStore {
         let mut preferences = emptyPreferences();
         preferences.set(
             &stringPreferencesKey(CORE_SPACE_RECORD_KEY),
-            serde_json::to_string(record).map_err(|error| error.to_string())?,
+            serde_json::to_value(record).map_err(|error| error.to_string())?,
         );
         self.recordStore(
             format!(
@@ -1071,7 +1243,7 @@ impl CoreSpaceStore {
         let mut preferences = emptyPreferences();
         preferences.set(
             &stringPreferencesKey(CORE_SPACE_RECORD_KEY),
-            serde_json::to_string(presence).map_err(|error| error.to_string())?,
+            serde_json::to_value(presence).map_err(|error| error.to_string())?,
         );
         self.recordStore(
             format!(
@@ -1090,7 +1262,7 @@ impl CoreSpaceStore {
         let mut preferences = emptyPreferences();
         preferences.set(
             &stringPreferencesKey(CORE_SPACE_RECORD_KEY),
-            serde_json::to_string(profile).map_err(|error| error.to_string())?,
+            serde_json::to_value(profile).map_err(|error| error.to_string())?,
         );
         self.recordStore(
             format!(
@@ -1109,12 +1281,54 @@ impl CoreSpaceStore {
         )
     }
 
+    /// Opens versioned complete Space records using the declared storage scope.
     fn recordStore(&self, path: impl Into<String>) -> PreferencesDataStore {
-        if self.recordSyncOperations {
+        let store = if self.recordSyncOperations {
             PreferencesDataStore::newWithStorage(self.storage.clone(), path)
         } else {
             (*CoreNodeStateStore::newWithStorage(self.storage.clone(), path)).clone()
+        };
+        store.withSchema(CORE_SPACE_RECORD_VERSION, Self::migrateRecord)
+    }
+
+    /// Declares the codec for complete records owned by Space, including archived string values.
+    pub fn preferenceSyncStore(path: &str) -> Option<crate::PreferenceMerge::PreferenceMergeStore> {
+        let (directory, name) = path.rsplit_once('/')?;
+        if ![RUNTIME_SPACE_MEMBERS_DIR_PATH, RUNTIME_SPACE_DEVICE_PROFILES_DIR_PATH,
+            RUNTIME_SPACE_DEVICE_PRESENCE_DIR_PATH, RUNTIME_SPACE_TOPOLOGY_DIR_PATH].contains(&directory) {
+            return None;
         }
+        let node = name.strip_suffix(".preferences.json")?;
+        if node.starts_with('.') || validateNodeId(node).is_err() { return None; }
+        Some(crate::PreferenceMerge::PreferenceMergeStore::values(
+            path, false, CORE_SPACE_RECORD_VERSION, Self::decodeSyncedRecord,
+        ))
+    }
+
+    /// Repairs schema-2 snapshots overwritten by unconverted history as well as older encodings.
+    fn migrateRecord(version: u32, values: &mut Preferences) -> Result<(), PreferencesDataStoreError> {
+        if version >= CORE_SPACE_RECORD_VERSION {
+            return Err(PreferencesDataStoreError::SchemaVersionTooNew {
+                actual: version, expected: CORE_SPACE_RECORD_VERSION,
+            });
+        }
+        let key = stringPreferencesKey(CORE_SPACE_RECORD_KEY);
+        if let Some(value) = values.get(&key) {
+            let record: serde_json::Map<String, serde_json::Value> = match value {
+                serde_json::Value::String(encoded) => serde_json::from_str(encoded)?,
+                value => serde_json::from_value(value.clone())?,
+            };
+            values.set(&key, serde_json::Value::Object(record));
+        }
+        Ok(())
+    }
+
+    /// Uses the same owner codec for local upgrades and historical operations; current values stay typed.
+    fn decodeSyncedRecord(entry: &mut PreferencesSyncedEntry) -> Result<(), PreferencesDataStoreError> {
+        entry.decodeHistoricalValues(|version, values| {
+            if version == CORE_SPACE_RECORD_VERSION { return Ok(()); }
+            Self::migrateRecord(version, values)
+        })
     }
 
 }
@@ -1208,7 +1422,6 @@ fn validateDevicePresence(presence: &CoreSpaceDevicePresence) -> Result<(), Stri
     validateNodeId(&presence.nodeId)?;
     if presence.active {
         validateDevicePresenceField("base URL", &presence.baseUrl)?;
-        validateDevicePresenceField("token hash", &presence.tokenHash)?;
         validateDevicePresenceField("version", &presence.version)?;
     }
     if presence.updatedAt <= 0 {
@@ -1366,6 +1579,25 @@ fn linkCost(link: &CoreSpaceLinkAdvertisement) -> u64 {
         .saturating_add(u64::from(link.congestionPermille).saturating_mul(10))
 }
 
+/// Rebuilds the ordered hop list of one resolved plan from the search predecessor chain.
+fn routePlanPath(
+    firstHop: &str,
+    targetNodeId: &str,
+    predecessor: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut path = vec![targetNodeId.to_string()];
+    let mut cursor = targetNodeId.to_string();
+    while cursor != firstHop {
+        let Some(previous) = predecessor.get(&cursor) else {
+            break;
+        };
+        path.push(previous.clone());
+        cursor = previous.clone();
+    }
+    path.reverse();
+    path
+}
+
 /// Validates one CoreNode identifier used by Space membership.
 fn validateNodeId(nodeId: &str) -> Result<(), String> {
     if nodeId.trim().is_empty() {
@@ -1397,12 +1629,44 @@ mod tests {
     use crate::SyncOperationStore::SyncOperationStore;
     use crate::SyncOperationStore::{NewSyncOperation, SyncOperationSemantics};
 
+    /// Schema 2 could be overwritten by raw historical JSON; reopening must repair it once.
+    #[test]
+    fn schema_two_space_records_recover_without_changing_membership() {
+        let host = Arc::new(MemoryStorageHost::default());
+        let record = serde_json::json!({"spaceId":"old-space","spaceName":"ios-aarch64",
+            "spaceRevision":12,"nodeId":"old-peer","joinedAt":1,"updatedAt":2});
+        let path = format!("{RUNTIME_SPACE_MEMBERS_DIR_PATH}/old-peer.preferences.json");
+        let corrupted = serde_json::json!({"record":record.to_string(),
+            "__operit_preferences_schema_version":2});
+        host.writeBytesAtomically(&path, &serde_json::to_vec(&corrupted).unwrap()).unwrap();
+        for _ in 0..2 {
+            let store = CoreSpaceStore::new(host.clone());
+            store.initialize().unwrap();
+            assert_eq!(serde_json::to_value(&store.memberRecords().unwrap()["old-peer"]).unwrap(), record);
+            assert_eq!(store.recordStore(&path).schemaVersion().unwrap(), CORE_SPACE_RECORD_VERSION);
+        }
+        let malformed = serde_json::json!({"record":"broken-json","__operit_preferences_schema_version":2});
+        let badPath = format!("{RUNTIME_SPACE_MEMBERS_DIR_PATH}/broken-peer.preferences.json");
+        let bytes = serde_json::to_vec(&malformed).unwrap();
+        host.writeBytesAtomically(&badPath, &bytes).unwrap();
+        assert!(CoreSpaceStore::new(host.clone()).initialize().is_err());
+        assert_eq!(host.readBytes(&badPath).unwrap(), bytes);
+    }
+
     #[derive(Clone, Default)]
     struct MemoryStorageHost {
         files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     }
 
     impl RuntimeStorageHost for MemoryStorageHost {
+        /// Confirms synchronous in-memory publication without copying or rewriting bytes.
+        fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
+            if !self.exists(path)? {
+                return Err(operit_host_api::HostError::new("runtime storage entry not found"));
+            }
+            Ok(())
+        }
+
         /// Returns no physical runtime root for the in-memory test host.
         fn runtimeRootDir(&self) -> Option<std::path::PathBuf> {
             None
@@ -1441,6 +1705,11 @@ mod tests {
                 .ok_or_else(|| HostError::new("runtime storage byte range overflows usize"))?
                 .min(content.len());
             Ok(content[start..end].to_vec())
+        }
+
+        /// Atomically publishes one complete in-memory test entry.
+        fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
+            self.writeBytes(path, content)
         }
 
         /// Writes one complete virtual file to the in-memory test host.
@@ -1581,6 +1850,7 @@ mod tests {
                 platform: "test".to_string(),
                 model: "test".to_string(),
                 coreVersion: Some("test".to_string()),
+                pairingIncarnation: None,
                 updatedAt: currentTimeMillis(),
             })
             .expect("test member device profile must write");
@@ -1594,8 +1864,39 @@ mod tests {
                 "test".to_string(),
                 "test".to_string(),
                 "test".to_string(),
+                None,
             )
             .expect("test device profile must initialize");
+    }
+
+    /// A killed process leaves an atomic-write staging sibling in the members
+    /// directory; Space initialization must skip it instead of panicking.
+    #[test]
+    fn initialize_ignores_leftover_partial_staging_files_in_members_directory() {
+        let host = Arc::new(MemoryStorageHost::default());
+        let store = CoreSpaceStore::new(host.clone());
+        initializeTestDeviceProfile(&store);
+        store
+            .initializeNamed("local-space".to_string())
+            .expect("test space must initialize");
+        host.writeBytes(
+            &format!(
+                "{RUNTIME_SPACE_MEMBERS_DIR_PATH}/.core-staging.preferences.json.3d75c4a5-2e81-4d0a-8f85-11ee23df1e79.partial"
+            ),
+            b"uncommitted",
+        )
+        .expect("test staging file must write");
+
+        let space = store
+            .initialize()
+            .expect("leftover staging files must not break Space initialization");
+        assert!(
+            space
+                .members
+                .iter()
+                .all(|member| !member.contains("staging")),
+            "the staging sibling must not surface as a member"
+        );
     }
 
     /// Verifies remote member ejection rewrites the member as a standalone
@@ -1785,6 +2086,129 @@ mod tests {
             .expect("unmeasured graph lookup must succeed");
 
         assert_eq!(route.as_deref(), Some(targetNodeId));
+    }
+
+    /// Verifies adjacency publication is idempotent, refreshes expiring links and prunes peers.
+    #[test]
+    fn adjacency_publication_refreshes_only_what_expired() {
+        let host = Arc::new(MemoryStorageHost::default());
+        let store = CoreSpaceStore::new(host.clone());
+        let localSpace = store
+            .initializeNamed("adjacency-space".to_string())
+            .expect("test space must initialize");
+        let localNodeId = CoreNodeIdentityStore::new(host)
+            .initialize()
+            .expect("test node identity must initialize")
+            .nodeId;
+        store
+            .writeSpaceProjection(
+                localSpace.spaceId,
+                localSpace.spaceName,
+                localSpace.spaceRevision,
+                BTreeSet::from([localNodeId.clone(), "node-peer".to_string()]),
+            )
+            .expect("test space projection must include the peer");
+
+        let ttl = 600_000_i64;
+        let margin = 300_000_i64;
+        assert!(store
+            .publishLocalAdjacency(vec!["node-peer".to_string()], ttl, margin)
+            .expect("first adjacency publication must succeed"));
+        let record = store
+            .topologyRecords()
+            .expect("topology must read")
+            .remove(&localNodeId)
+            .expect("local adjacency record must exist");
+        assert_eq!(record.peers, vec!["node-peer".to_string()]);
+        assert_eq!(record.links.len(), 1);
+        assert!(record.links[0].expiresAt > currentTimeMillis());
+
+        // A second publication with a fresh link changes nothing.
+        assert!(!store
+            .publishLocalAdjacency(vec!["node-peer".to_string()], ttl, margin)
+            .expect("idempotent adjacency publication must succeed"));
+
+        // A link nearing its expiry is rewritten with a fresh lifetime and sequence.
+        writeTestTopology(&store, &localNodeId, vec![testLink("node-peer", 0)]);
+        assert!(store
+            .publishLocalAdjacency(vec!["node-peer".to_string()], ttl, margin)
+            .expect("refreshing adjacency publication must succeed"));
+        let refreshed = store
+            .topologyRecords()
+            .expect("topology must read")
+            .remove(&localNodeId)
+            .expect("local adjacency record must exist");
+        assert_eq!(refreshed.links[0].sequence, 2);
+        assert!(refreshed.links[0].expiresAt > currentTimeMillis() + margin);
+
+        // Dropping the peer prunes both the announcement and its link.
+        assert!(store
+            .publishLocalAdjacency(Vec::new(), ttl, margin)
+            .expect("pruning adjacency publication must succeed"));
+        let pruned = store
+            .topologyRecords()
+            .expect("topology must read")
+            .remove(&localNodeId)
+            .expect("local adjacency record must exist");
+        assert!(pruned.peers.is_empty());
+        assert!(pruned.links.is_empty());
+    }
+
+    /// Verifies published adjacency resolves one tree path through the middle device.
+    #[test]
+    fn adjacency_publication_resolves_tree_route_plan() {
+        let host = Arc::new(MemoryStorageHost::default());
+        let store = CoreSpaceStore::new(host.clone());
+        let localSpace = store
+            .initializeNamed("tree-space".to_string())
+            .expect("test space must initialize");
+        let localNodeId = CoreNodeIdentityStore::new(host)
+            .initialize()
+            .expect("test node identity must initialize")
+            .nodeId;
+        let middleNodeId = "node-middle";
+        let leafNodeId = "node-leaf";
+        store
+            .writeSpaceProjection(
+                localSpace.spaceId,
+                localSpace.spaceName,
+                localSpace.spaceRevision,
+                BTreeSet::from([
+                    localNodeId.clone(),
+                    middleNodeId.to_string(),
+                    leafNodeId.to_string(),
+                ]),
+            )
+            .expect("test space projection must include both devices");
+        store
+            .publishLocalAdjacency(vec![middleNodeId.to_string()], 600_000, 300_000)
+            .expect("local adjacency must publish");
+        // The middle device announces its own leaf link the same way production does.
+        writeTestTopology(&store, middleNodeId, vec![testLink(leafNodeId, 0)]);
+
+        let plan = store
+            .routePlanThroughPeers(
+                leafNodeId.to_string(),
+                BTreeSet::from([middleNodeId.to_string()]),
+            )
+            .expect("tree path must resolve")
+            .expect("leaf must be reachable through the middle device");
+        assert_eq!(
+            plan.path,
+            vec![middleNodeId.to_string(), leafNodeId.to_string()]
+        );
+        assert_eq!(plan.hops(), 2);
+        assert_eq!(plan.firstHop(), middleNodeId);
+
+        let direct = store
+            .routePlanThroughPeers(
+                middleNodeId.to_string(),
+                BTreeSet::from([middleNodeId.to_string()]),
+            )
+            .expect("direct path must resolve")
+            .expect("middle device must stay reachable");
+        assert_eq!(direct.path, vec![middleNodeId.to_string()]);
+        assert_eq!(direct.hops(), 1);
     }
 
     /// Verifies a non-relay device cannot be selected as a multi-hop forwarding node.
@@ -1987,6 +2411,7 @@ mod tests {
         assert_eq!(*host.files.lock().unwrap(), before);
     }
 
+    /// Keeps business clocks separate from authority projection and checks explicit storage revocation.
     #[test]
     fn authority_projection_does_not_skip_older_business_operations_after_storage_grant() {
         let source = Arc::new(MemoryStorageHost::default());
@@ -1996,13 +2421,15 @@ mod tests {
         sourcePolicy.initializeCurrentSpace().unwrap();
         addTestSpaceMember(&sourceSpace, "projection-member");
         sourcePolicy.admitMember("projection-member".into()).unwrap();
-        sourcePolicy.setIdentity(NetworkControlIdentityAssignment { nodeId: "projection-member".into(), roleId: "runner".into() }).unwrap();
+        sourcePolicy.setIdentity(NetworkControlIdentityAssignment { nodeId: "projection-member".into(), roleId: "edge".into() }).unwrap();
         let sourceLog = SyncOperationStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH);
         let business = sourceLog.appendLocalOperation(&CoreNodeIdentityStore::new(source.clone()).initialize().unwrap().nodeId, NewSyncOperation {
             domain: "chat".into(), entityType: "test".into(), entityId: "older-message".into(),
             operation: "write".into(), semantics: SyncOperationSemantics::Transaction, payload: serde_json::json!({}),
         }).unwrap();
-        sourcePolicy.setIdentity(NetworkControlIdentityAssignment { nodeId: "projection-member".into(), roleId: "storage".into() }).unwrap();
+        sourcePolicy.defineRole(NetworkControlRole { roleId: "replica".into(), displayName: "Test replica".into(),
+            capabilities: BTreeSet::from(["storage.provide".into()]) }).unwrap();
+        sourcePolicy.setIdentity(NetworkControlIdentityAssignment { nodeId: "projection-member".into(), roleId: "replica".into() }).unwrap();
         let receiver = Arc::new(MemoryStorageHost::default());
         CoreNodeIdentityStore::new(receiver.clone()).writeNodeId("projection-member".into()).unwrap();
         let receiverSpace = CoreSpaceStore::newNodeLocal(receiver.clone());
@@ -2035,7 +2462,12 @@ mod tests {
             "a storage member cannot forge an unknown command attributed to the administrator");
         assert_eq!(receiver.readBytes("runtime/link_access/space_policy.preferences.json").unwrap(), before);
         receiverPolicy.projectPeerControlOperations(&admin, std::slice::from_ref(&next)).unwrap();
-        let revoke = sourcePolicy.clearIdentity("projection-member".into()).unwrap();
+        let reset = sourcePolicy.clearIdentity("projection-member".into()).unwrap();
+        receiverPolicy.projectPeerControlOperations(&admin, std::slice::from_ref(&reset)).unwrap();
+        assert!(receiverPolicy.nodeHasCapability("projection-member", "storage.provide", None).unwrap());
+        let revoke = sourcePolicy.setIdentity(NetworkControlIdentityAssignment {
+            nodeId: "projection-member".into(), roleId: "edge".into(),
+        }).unwrap();
         receiverPolicy.projectPeerControlOperations(&admin, std::slice::from_ref(&revoke)).unwrap();
         assert!(!receiverPolicy.nodeHasCapability("projection-member", "storage.provide", None).unwrap());
         sourcePolicy.defineRole(NetworkControlRole { roleId: "limited-manager".into(), displayName: "Limited manager".into(),
@@ -2050,8 +2482,9 @@ mod tests {
         assert_eq!(SyncOperationStore::new(receiver, RUNTIME_SYNC_DIR_PATH).localClock().unwrap().sequenceFor(&admin), 0);
     }
 
+    /// Gives ordinary admitted members the declared shared storage capability.
     #[test]
-    fn network_control_admission_assigns_the_default_user_capabilities_without_storage() {
+    fn network_control_admission_assigns_the_default_user_capabilities_with_storage() {
         let host = Arc::new(MemoryStorageHost::default());
         let spaceStore = CoreSpaceStore::new(host.clone());
         initializeTestDeviceProfile(&spaceStore);
@@ -2066,15 +2499,12 @@ mod tests {
             .expect("administrator must admit a member");
 
         assert!(control
-            .nodeHasCapability("peer-member", "network.user", None)
-            .expect("default user capability must materialize"));
+            .nodeHasCapability("peer-member", "network.devices.view", None)
+            .expect("default user device view capability must materialize"));
         assert!(control
-            .nodeHasCapability("peer-member", "chat.read", None)
-            .expect("default user chat read capability must materialize"));
-        assert!(!control
             .nodeHasCapability("peer-member", "storage.provide", None)
             .expect("default user storage capability must be evaluated"),
-            "ordinary membership must not grant Space storage by default");
+            "ordinary membership must grant its declared Space storage capability");
         assert!(control
             .nodeHasCapability("peer-member", "network.relay", None)
             .expect("default user relay capability must materialize"));
@@ -2098,15 +2528,19 @@ mod tests {
         control
             .admitMember("peer-runner".to_string())
             .expect("administrator must admit a member");
+        control.defineRole(NetworkControlRole {
+            roleId: "history-reader".into(), displayName: "History reader".into(),
+            capabilities: BTreeSet::from(["network.audit.read".into()]),
+        }).unwrap();
         control
             .setIdentity(NetworkControlIdentityAssignment {
                 nodeId: "peer-runner".to_string(),
-                roleId: "auditor".to_string(),
+                roleId: "history-reader".to_string(),
             })
-            .expect("administrator must grant auditor role");
+            .expect("administrator must grant custom history reader role");
         assert!(control
             .nodeHasCapability("peer-runner", "network.audit.read", None)
-            .expect("auditor capability must materialize"));
+            .expect("audit capability must materialize"));
 
         control
             .removeMember("peer-runner".to_string())
@@ -2117,10 +2551,10 @@ mod tests {
 
         assert!(!control
             .nodeHasCapability("peer-runner", "network.audit.read", None)
-            .expect("readmitted member must not regain auditor capability"));
+            .expect("readmitted member must not regain audit capability"));
         assert!(control
-            .nodeHasCapability("peer-runner", "network.user", None)
-            .expect("readmitted member must receive ordinary capability"));
+            .nodeHasCapability("peer-runner", "network.devices.view", None)
+            .expect("readmitted member must receive device view capability"));
         assert!(control
             .nodeHasCapability("peer-runner", "runtime.execute", None)
             .expect("readmitted member must receive default execution capability"));

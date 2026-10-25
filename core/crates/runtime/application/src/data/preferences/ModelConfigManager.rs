@@ -1,3 +1,5 @@
+use operit_host_api::PluginStorage::{StoragePreferencesMergeCatalog, StoragePreferencesMergeDescriptor};
+use operit_store::PreferenceMerge::PreferenceMergeStore;
 use std::path::PathBuf;
 
 use std::collections::HashSet;
@@ -80,7 +82,64 @@ pub struct ModelConfigManager {
 }
 
 impl ModelConfigManager {
-    const PREFERENCES_VERSION: u32 = 3;
+    /// Opens this owner's versioned store through the supplied runtime storage host.
+    pub(crate) fn preferenceStore(
+        storage: std::sync::Arc<dyn operit_host_api::RuntimeStorageHost>,
+        path: impl Into<String>,
+    ) -> PreferencesDataStore {
+        PreferencesDataStore::newEncryptedWithStorage(storage, path)
+            .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences)
+    }
+
+    /// Imports each historical provider value with its declared encoding and preserves its stable identity.
+    fn decodeSyncedEntry(entry: &mut operit_store::PreferencesDataStore::PreferencesSyncedEntry) -> Result<(), PreferencesDataStoreError> {
+        entry.decodeHistoricalValues(|version, values| {
+            if version > Self::PREFERENCES_VERSION {
+                return Err(PreferencesDataStoreError::SchemaVersionTooNew { actual: version, expected: Self::PREFERENCES_VERSION });
+            }
+            if version < 4 {
+                let records = values.iterEntries().filter(|(key, _)| key.starts_with("provider_") && *key != "provider_list")
+                    .map(|(key, value)| (key.to_owned(), value.clone())).collect::<Vec<_>>();
+                for (key, value) in records {
+                    let encoded: String = serde_json::from_value(value)?;
+                    let mut provider: ProviderProfile = serde_json::from_str(&encoded)?;
+                    if version < 3 {
+                        provider = Self::providerWithProviderOwnedThinkingRules(provider)
+                            .map_err(|error| PreferencesDataStoreError::Message(error.to_string()))?;
+                    }
+                    values.set(&stringPreferencesKey(&key), serde_json::to_value(provider)?);
+                }
+            }
+            values.remove(&Self::PROVIDER_LIST_KEY());
+            Ok(())
+        })
+    }
+
+    /// Declares this owner's catalog and references using the shared merge contract.
+    pub(crate) fn spaceMergeStore() -> PreferenceMergeStore {
+        let path = operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH;
+        PreferenceMergeStore {
+            path: path.to_string(),
+            encrypted: true,
+            storageVersion: Some(Self::PREFERENCES_VERSION),
+            decode: Some(Self::decodeSyncedEntry),
+            merge: StoragePreferencesMergeDescriptor {
+                version: 1,
+                catalog: Some(StoragePreferencesMergeCatalog {
+                    key_prefix: "provider_".to_string(),
+                    key_suffix: "".to_string(),
+                    identity_field: "id".to_string(),
+                    name_field: "name".to_string(),
+                    ignored_fields: vec!["createdAt".to_string(), "updatedAt".to_string()],
+                    retired_keys: vec!["provider_list".to_string()],
+                }),
+                references: vec![],
+                projection: None,
+            },
+        }
+    }
+
+    const PREFERENCES_VERSION: u32 = 5;
     pub const DEFAULT_PROVIDER_ID: &'static str = ModelConfigDefaults::DEFAULT_PROVIDER_ID;
     pub const DEFAULT_MODEL_ID: &'static str = ModelConfigDefaults::DEFAULT_MODEL_ID;
 
@@ -95,9 +154,10 @@ impl ModelConfigManager {
             &root_dir,
             operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH,
         );
-        let modelConfigDataStore = PreferencesDataStore::newEncrypted(path)
-            .withStructuredJsonSync()
-            .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences);
+        let modelConfigDataStore = Self::preferenceStore(
+            operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
+            operit_store::RuntimeStorageHost::runtimeStoragePath(&path),
+        );
         Self {
             runtimeRoot: root_dir,
             modelConfigDataStore,
@@ -197,10 +257,7 @@ impl ModelConfigManager {
         let provider = ProviderProfile::new(providerId.clone(), name, providerType, endpoint);
         self.modelConfigDataStore.try_edit_result(|preferences| {
             Self::assertProviderNameUniqueInPreferences(preferences, &provider.name, None)?;
-            let mut providerIds = Self::readProviderList(preferences)?;
-            providerIds.push(providerId.clone());
             Self::writeProvider(preferences, &provider)?;
-            Self::writeProviderList(preferences, &providerIds)?;
             Ok::<(), ModelConfigError>(())
         })?;
         Ok(providerId)
@@ -242,12 +299,7 @@ impl ModelConfigManager {
             return Err(ModelConfigError::ProviderNotFound(provider.id));
         }
         self.modelConfigDataStore.try_edit_result(|preferences| {
-            let mut providerIds = Self::readProviderList(preferences)?;
-            if !providerIds.iter().any(|id| id == Self::DEFAULT_PROVIDER_ID) {
-                providerIds.insert(0, Self::DEFAULT_PROVIDER_ID.to_string());
-            }
             Self::writeProvider(preferences, &provider)?;
-            Self::writeProviderList(preferences, &providerIds)?;
             Ok::<(), ModelConfigError>(())
         })?;
         Ok(provider)
@@ -258,10 +310,7 @@ impl ModelConfigManager {
         let providerKey = self.providerKey(providerId);
         self.modelConfigDataStore.try_edit_result(|preferences| {
             self.assertProviderExistsInPreferences(preferences, providerId)?;
-            let mut providerIds = Self::readProviderList(preferences)?;
-            providerIds.retain(|id| id != providerId);
             preferences.remove(&providerKey);
-            Self::writeProviderList(preferences, &providerIds)?;
             Ok::<(), ModelConfigError>(())
         })?;
         Ok(())
@@ -633,7 +682,7 @@ impl ModelConfigManager {
 
         self.modelConfigDataStore
             .try_edit_result(|preferences| {
-                let mut providerIds = Self::readProviderList(preferences)?;
+                let providerIds = Self::readProviderList(preferences)?;
                 let currentProviderIds = providerIds.iter().cloned().collect::<HashSet<_>>();
                 for currentProviderId in &providerIds {
                     if importedProviderIds.contains(currentProviderId.as_str()) {
@@ -654,13 +703,11 @@ impl ModelConfigManager {
                     if currentProviderIds.contains(&provider.id) {
                         updatedCount += 1;
                     } else {
-                        providerIds.push(provider.id.clone());
                         newCount += 1;
                     }
                     let provider = Self::providerWithProviderOwnedThinkingRules(provider.clone())?;
                     Self::writeProvider(preferences, &provider)?;
                 }
-                Self::writeProviderList(preferences, &providerIds)?;
 
                 Ok(ModelConfigImportResult {
                     new: newCount,
@@ -781,16 +828,29 @@ impl ModelConfigManager {
         model
     }
 
-    /// Reads provider ids from the preferences object.
+    /// Derives provider membership from complete records and validates their identities.
     fn readProviderList(
         preferences: &Preferences,
     ) -> Result<Vec<String>, PreferencesDataStoreError> {
-        match preferences.get(&Self::PROVIDER_LIST_KEY()) {
-            Some(providerList) if !providerList.is_empty() => {
-                Ok(serde_json::from_str(providerList)?)
+        let mut providers = Vec::new();
+        for (key, value) in preferences.iterEntries() {
+            let Some(id) = key.strip_prefix("provider_") else {
+                continue;
+            };
+            let provider: ProviderProfile = serde_json::from_value(value.clone())?;
+            if provider.id != id {
+                return Err(PreferencesDataStoreError::Message(format!(
+                    "Provider record identity mismatch: {key}"
+                )));
             }
-            _ => Ok(Vec::new()),
+            providers.push(provider);
         }
+        providers.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(providers.into_iter().map(|provider| provider.id).collect())
     }
 
     /// Migrates model preferences one schema version at a time.
@@ -800,42 +860,132 @@ impl ModelConfigManager {
     ) -> Result<(), PreferencesDataStoreError> {
         match version {
             0 => {
-                let mut providerIds = Self::readProviderList(preferences)?;
+                let mut providerIds = preferences
+                    .getTyped::<String>(&Self::PROVIDER_LIST_KEY())?
+                    .map(|encoded| serde_json::from_str::<Vec<String>>(&encoded))
+                    .transpose()?
+                    .unwrap_or_default();
                 if providerIds.is_empty() {
                     let provider = default_deepseek_provider();
-                    Self::writeProvider(preferences, &provider)?;
+                    preferences.set(
+                        &stringPreferencesKey(&format!("provider_{}", provider.id)),
+                        serde_json::to_string(&provider)?,
+                    );
                     providerIds.push(provider.id);
                 }
-                let localProvider = local_model_provider();
-                if !providerIds.iter().any(|id| id == &localProvider.id) {
-                    Self::writeProvider(preferences, &localProvider)?;
-                    providerIds.push(localProvider.id);
+                let provider = local_model_provider();
+                if !providerIds.iter().any(|id| id == &provider.id) {
+                    preferences.set(
+                        &stringPreferencesKey(&format!("provider_{}", provider.id)),
+                        serde_json::to_string(&provider)?,
+                    );
+                    providerIds.push(provider.id);
                 }
-                Self::writeProviderList(preferences, &providerIds)
+                preferences.set(
+                    &Self::PROVIDER_LIST_KEY(),
+                    serde_json::to_string(&providerIds)?,
+                );
+                Ok(())
             }
             1 => Ok(()),
-            2 => Self::normalizeProviderThinkingPreferences(preferences),
+            2 => {
+                let providerIds = preferences
+                    .getTyped::<String>(&Self::PROVIDER_LIST_KEY())?
+                    .map(|encoded| serde_json::from_str::<Vec<String>>(&encoded))
+                    .transpose()?
+                    .unwrap_or_default();
+                for id in providerIds {
+                    let key = stringPreferencesKey(&format!("provider_{id}"));
+                    let Some(encoded) = preferences.getTyped::<String>(&key)? else {
+                        continue;
+                    };
+                    let provider: ProviderProfile = serde_json::from_str(&encoded)?;
+                    let provider = Self::providerWithProviderOwnedThinkingRules(provider)
+                        .map_err(|error| PreferencesDataStoreError::Message(error.to_string()))?;
+                    preferences.set(&key, serde_json::to_string(&provider)?);
+                }
+                Ok(())
+            }
+            3 => {
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("provider_")?;
+                        (key != "provider_list").then(|| (key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in records {
+                    let encoded = serde_json::from_value::<String>(value)?;
+                    let mut record: serde_json::Value = serde_json::from_str(&encoded)?;
+                    for field in ["providerTypeId", "providerType"] {
+                        let removed = record
+                            .get(field)
+                            .and_then(|value| value.as_str())
+                            .map(|value| {
+                                Self::REMOVED_PROVIDER_TYPE_IDS
+                                    .iter()
+                                    .any(|removed| value.trim().eq_ignore_ascii_case(removed))
+                            })
+                            .unwrap_or(false);
+                        if removed {
+                            record[field] = serde_json::json!(ApiProviderType::OTHER.name());
+                        }
+                    }
+                    let provider: ProviderProfile = serde_json::from_value(record.clone())?;
+                    let id = key
+                        .strip_prefix("provider_")
+                        .expect("provider record prefix");
+                    if provider.id != id {
+                        return Err(PreferencesDataStoreError::Message(format!(
+                            "Provider record identity mismatch: {key}"
+                        )));
+                    }
+                    preferences.set(&stringPreferencesKey(&key), record);
+                }
+                preferences.remove(&Self::PROVIDER_LIST_KEY());
+                Ok(())
+            }
+            4 => {
+                // iFlow was removed as a provider type. A version-four record naming it
+                // fails to deserialize in readProviderList, so rewrite it to OTHER here
+                // before any later arm or the provider list reads it.
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        (key != "provider_list" && key.starts_with("provider_"))
+                            .then(|| (key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in records {
+                    let mut record = value;
+                    for field in ["providerTypeId", "providerType"] {
+                        let removed = record
+                            .get(field)
+                            .and_then(|value| value.as_str())
+                            .map(|value| {
+                                Self::REMOVED_PROVIDER_TYPE_IDS
+                                    .iter()
+                                    .any(|removed| value.trim().eq_ignore_ascii_case(removed))
+                            })
+                            .unwrap_or(false);
+                        if removed {
+                            record[field] = serde_json::json!(ApiProviderType::OTHER.name());
+                        }
+                    }
+                    preferences.set(&stringPreferencesKey(&key), record);
+                }
+                Ok(())
+            }
             from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
         }
     }
 
-    /// Removes catalog-only provider selectors from stored provider thinking rules.
-    fn normalizeProviderThinkingPreferences(
-        preferences: &mut Preferences,
-    ) -> Result<(), PreferencesDataStoreError> {
-        let providerIds = Self::readProviderList(preferences)?;
-        for providerId in providerIds {
-            let providerKey = stringPreferencesKey(&format!("provider_{providerId}"));
-            let Some(providerJson) = preferences.get(&providerKey) else {
-                continue;
-            };
-            let provider: ProviderProfile = serde_json::from_str(providerJson)?;
-            let provider = Self::providerWithProviderOwnedThinkingRules(provider)
-                .map_err(|error| PreferencesDataStoreError::Message(error.to_string()))?;
-            Self::writeProvider(preferences, &provider)?;
-        }
-        Ok(())
-    }
+    /// Provider type ids that earlier builds could persist but that no longer exist in
+    /// `ApiProviderType`. A provider record naming one fails to deserialize, which makes
+    /// `readProviderList` reject the whole store. Migrations that can encounter such a
+    /// record rewrite its two provider-type fields to the OpenAI-compatible catch-all
+    /// before the provider list is read.
+    const REMOVED_PROVIDER_TYPE_IDS: [&'static str; 1] = ["IFLOW"];
 
     /// Loads and decodes one provider profile from preferences.
     fn loadProviderFromDataStore(
@@ -847,21 +997,13 @@ impl ModelConfigManager {
         let providerJson = preferences
             .get(&providerKey)
             .ok_or_else(|| ModelConfigError::ProviderNotFound(providerId.to_string()))?;
-        Ok(serde_json::from_str(providerJson)?)
+        Ok(serde_json::from_value(providerJson.clone())?)
     }
 
     /// Saves one provider profile to preferences.
     fn saveProviderToDataStore(&self, provider: &ProviderProfile) -> Result<(), ModelConfigError> {
         self.modelConfigDataStore.try_edit_result(|preferences| {
             Self::writeProvider(preferences, provider)?;
-            Ok::<(), ModelConfigError>(())
-        })
-    }
-
-    /// Saves provider order to preferences.
-    fn saveProviderList(&self, providerIds: Vec<String>) -> Result<(), ModelConfigError> {
-        self.modelConfigDataStore.try_edit_result(|preferences| {
-            Self::writeProviderList(preferences, &providerIds)?;
             Ok::<(), ModelConfigError>(())
         })
     }
@@ -921,6 +1063,7 @@ impl ModelConfigManager {
         }
     }
 
+    /// Reads a complete native JSON provider record from the current snapshot.
     fn readProviderFromPreferences(
         &self,
         preferences: &Preferences,
@@ -930,19 +1073,21 @@ impl ModelConfigManager {
         let providerJson = preferences
             .get(&providerKey)
             .ok_or_else(|| ModelConfigError::ProviderNotFound(providerId.to_string()))?;
-        Ok(serde_json::from_str(providerJson)?)
+        Ok(serde_json::from_value(providerJson.clone())?)
     }
 
+    /// Writes the complete provider as the synchronized preference value.
     fn writeProvider(
         preferences: &mut Preferences,
         provider: &ProviderProfile,
     ) -> Result<(), PreferencesDataStoreError> {
         let providerKey = stringPreferencesKey(&format!("provider_{}", provider.id));
-        let encodedProvider = serde_json::to_string(provider)?;
+        let encodedProvider = serde_json::to_value(provider)?;
         preferences.set(&providerKey, encodedProvider);
         Ok(())
     }
 
+    /// Checks provider name uniqueness against all stored records.
     fn assertProviderNameUniqueInPreferences(
         preferences: &Preferences,
         name: &str,
@@ -958,7 +1103,7 @@ impl ModelConfigManager {
             let Some(providerJson) = preferences.get(&providerKey) else {
                 continue;
             };
-            let provider: ProviderProfile = serde_json::from_str(providerJson)?;
+            let provider: ProviderProfile = serde_json::from_value(providerJson.clone())?;
             if provider.name.trim() == normalizedName {
                 return Err(ModelConfigError::ProviderNameAlreadyExists(
                     normalizedName.to_string(),
@@ -967,15 +1112,6 @@ impl ModelConfigManager {
         }
         Ok(())
     }
-    fn writeProviderList(
-        preferences: &mut Preferences,
-        providerIds: &[String],
-    ) -> Result<(), PreferencesDataStoreError> {
-        let encoded = serde_json::to_string(providerIds)?;
-        preferences.set(&Self::PROVIDER_LIST_KEY(), encoded);
-        Ok(())
-    }
-
     fn findAvailableProviderModel(
         &self,
         provider: &ProviderProfile,
@@ -1111,15 +1247,83 @@ impl ModelConfigManager {
         .read()
         .map_err(|error| ModelConfigError::ModelListFetch(error.to_string()))?;
         let platform = LocalPlatformTarget::current().map_err(ModelConfigError::ModelListFetch)?;
-        let mut models = registry
+        if registry
             .installedModels
+            .iter()
+            .all(|model| model.manifest.kind != LocalModelKind::Chat)
+            && provider
+                .models
+                .iter()
+                .all(|model| model.localRuntime.inferenceBindingKey.is_empty())
+        {
+            provider.models.clear();
+            return Ok(provider);
+        }
+        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
+        let identity =
+            operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(storage.clone())
+                .initialize()
+                .map_err(ModelConfigError::ModelListFetch)?;
+        let bindings =
+            operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage.clone())
+                .map_err(ModelConfigError::ModelListFetch)?;
+        let mut saved = provider
+            .models
             .into_iter()
-            .filter(|installed| {
-                installed.manifest.kind == LocalModelKind::Chat
-                    && installed.manifest.supportsPlatform(&platform.platform)
-            })
-            .map(|installed| ModelProfile::new(installed.manifest.registryKey()))
-            .collect::<Vec<_>>();
+            .map(|model| (model.id.clone(), model))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut models = Vec::new();
+        for installed in registry.installedModels.into_iter().filter(|installed| {
+            installed.manifest.kind == LocalModelKind::Chat
+                && installed.manifest.supportsPlatform(&platform.platform)
+        }) {
+            let id = installed.manifest.registryKey();
+            let mut model = saved
+                .remove(&id)
+                .unwrap_or_else(|| ModelProfile::new(id.clone()));
+            let binding_key = &model.localRuntime.inferenceBindingKey;
+            let uses_remote_inference = !binding_key.is_empty()
+                && bindings
+                    .bindingOptional(binding_key)
+                    .map_err(ModelConfigError::ModelListFetch)?
+                    .is_some_and(|binding| binding.nodeId != identity.nodeId);
+            // Installing matching weights here must preserve an explicitly selected remote owner.
+            if !uses_remote_inference {
+                model.localRuntime.inferenceBindingKey =
+                    crate::services::LocalLlmService::ensureLocalLlmBinding(storage.clone(), &id)
+                        .map_err(ModelConfigError::ModelListFetch)?;
+            }
+            if model.contextOverride.is_none() {
+                model.contextOverride = Some(ModelContextSpec {
+                    maxContextLength: model.localRuntime.llamaContextSize as f32 / 1000.0,
+                });
+            }
+            if model.capabilitiesOverride.is_none() {
+                model.capabilitiesOverride = Some(ModelCapabilities {
+                    toolCall: true,
+                    ..ModelCapabilities::default()
+                });
+            }
+            if model.requestOverride.is_none() {
+                model.requestOverride = Some(ModelRequestSpec {
+                    supportsStructuredTools: false,
+                    ..ModelRequestSpec::default()
+                });
+            }
+            models.push(model);
+        }
+        // Saved references can use another node's model without mirroring its installation inventory.
+        for model in saved.into_values() {
+            let key = &model.localRuntime.inferenceBindingKey;
+            if !key.is_empty()
+                && bindings
+                    .bindingOptional(key)
+                    .map_err(ModelConfigError::ModelListFetch)?
+                    .is_some_and(|binding| binding.nodeId != identity.nodeId)
+            {
+                models.push(model);
+            }
+        }
         models.sort_by(|left, right| left.id.cmp(&right.id));
         provider.models = models;
         Ok(provider)
@@ -1145,11 +1349,9 @@ impl ModelConfigManager {
         stringPreferencesKey(&format!("provider_{providerId}"))
     }
 
+    /// Allocates a provider identity independently of device clocks and names.
     fn createProviderId(&self) -> String {
-        format!(
-            "provider_{}",
-            operit_host_api::TimeUtils::currentTimeMillis()
-        )
+        uuid::Uuid::new_v4().to_string()
     }
 }
 
@@ -1166,12 +1368,302 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Starts a persisted version-three file at its appended migration and preserves unindexed providers.
+    #[test]
+    fn schema_three_migration_does_not_execute_initialization() {
+        use operit_model::ModelConfigData::ProviderProfile;
+        use operit_store::PreferencesDataStore::{stringPreferencesKey, CoreNodeStateStore};
+        let root = unique_test_root("schema_three_native_json");
+        let host: Arc<dyn RuntimeStorageHost> =
+            Arc::new(TestRuntimeStorageHost { root: root.clone() });
+        let path = "runtime/config/model-schema-three.preferences.json";
+        let first = ProviderProfile::new(
+            "first".into(),
+            "First".into(),
+            ApiProviderType::OPENAI,
+            "https://example.test".into(),
+        );
+        let second = ProviderProfile::new(
+            "unindexed".into(),
+            "Unindexed".into(),
+            ApiProviderType::OPENAI,
+            "https://example.test".into(),
+        );
+        let legacy = serde_json::json!({
+            "__operit_preferences_schema_version": "3",
+            "provider_list": "[\"first\"]",
+            "provider_first": serde_json::to_string(&first).unwrap(),
+            "provider_unindexed": serde_json::to_string(&second).unwrap()
+        });
+        host.writeBytes(path, &serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+        let expectedMigrationStep = std::sync::atomic::AtomicU32::new(3);
+        let store = CoreNodeStateStore::newWithStorage(host, path).withSchema(
+            ModelConfigManager::PREFERENCES_VERSION,
+            move |version, preferences| {
+                assert_eq!(
+                    version,
+                    expectedMigrationStep.load(std::sync::atomic::Ordering::SeqCst),
+                    "an existing file must run its migrations in order"
+                );
+                expectedMigrationStep.store(version + 1, std::sync::atomic::Ordering::SeqCst);
+                ModelConfigManager::migratePreferences(version, preferences)
+            },
+        );
+        let migrated = store.data().unwrap();
+        assert_eq!(
+            ModelConfigManager::readProviderList(&migrated).unwrap(),
+            vec!["first", "unindexed"]
+        );
+        assert!(migrated
+            .get(&stringPreferencesKey("provider_first"))
+            .unwrap()
+            .is_object());
+        assert!(migrated
+            .get(&stringPreferencesKey("provider_list"))
+            .is_none());
+        assert_eq!(store.schemaVersion().unwrap(), 5);
+        assert_eq!(store.data().unwrap(), migrated);
+    }
+
+    /// Rewrites a persisted iFlow provider to the OpenAI-compatible catch-all so the list stays readable.
+    #[test]
+    fn iflow_provider_migrates_to_other_provider_type() {
+        use operit_model::ModelConfigData::ProviderProfile;
+        use operit_store::PreferencesDataStore::{stringPreferencesKey, CoreNodeStateStore};
+        let root = unique_test_root("schema_four_iflow");
+        let host: Arc<dyn RuntimeStorageHost> =
+            Arc::new(TestRuntimeStorageHost { root: root.clone() });
+        let path = "runtime/config/model-schema-four.preferences.json";
+        let iflow = ProviderProfile::new(
+            "iflow".into(),
+            "iFlow".into(),
+            ApiProviderType::OPENAI,
+            "https://apis.iflow.cn/v1/chat/completions".into(),
+        );
+        let mut record = serde_json::to_value(&iflow).unwrap();
+        record["providerTypeId"] = serde_json::json!("IFLOW");
+        record["providerType"] = serde_json::json!("IFLOW");
+        let openai = ProviderProfile::new(
+            "openai".into(),
+            "OpenAI".into(),
+            ApiProviderType::OPENAI,
+            "https://api.openai.com/v1/chat/completions".into(),
+        );
+        let legacy = serde_json::json!({
+            "__operit_preferences_schema_version": "4",
+            "provider_iflow": record,
+            "provider_openai": serde_json::to_value(&openai).unwrap()
+        });
+        host.writeBytes(path, &serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+        let store = CoreNodeStateStore::newWithStorage(host, path).withSchema(
+            ModelConfigManager::PREFERENCES_VERSION,
+            |version, preferences| {
+                assert_eq!(
+                    version, 4,
+                    "an existing version-four file keeps its own arm"
+                );
+                ModelConfigManager::migratePreferences(version, preferences)
+            },
+        );
+        let migrated = store.data().unwrap();
+        let iflowRecord = migrated
+            .get(&stringPreferencesKey("provider_iflow"))
+            .unwrap();
+        assert_eq!(iflowRecord["providerTypeId"], "OTHER");
+        assert_eq!(iflowRecord["providerType"], "OTHER");
+        assert_eq!(iflowRecord["name"], "iFlow");
+        let openaiRecord = migrated
+            .get(&stringPreferencesKey("provider_openai"))
+            .unwrap();
+        assert_eq!(openaiRecord["providerTypeId"], "OPENAI");
+        assert_eq!(openaiRecord["providerType"], "OPENAI");
+        assert_eq!(
+            ModelConfigManager::readProviderList(&migrated).unwrap(),
+            vec!["openai", "iflow"]
+        );
+        assert_eq!(store.schemaVersion().unwrap(), 5);
+    }
+
+    /// Cleans an iFlow record on an older file whose arms still parse full provider profiles.
+    #[test]
+    fn iflow_provider_migrates_from_schema_three() {
+        use operit_model::ModelConfigData::ProviderProfile;
+        use operit_store::PreferencesDataStore::{stringPreferencesKey, CoreNodeStateStore};
+        let root = unique_test_root("schema_three_iflow");
+        let host: Arc<dyn RuntimeStorageHost> =
+            Arc::new(TestRuntimeStorageHost { root: root.clone() });
+        let path = "runtime/config/model-schema-three-iflow.preferences.json";
+        let iflow = ProviderProfile::new(
+            "iflow".into(),
+            "iFlow".into(),
+            ApiProviderType::OPENAI,
+            "https://apis.iflow.cn/v1/chat/completions".into(),
+        );
+        let mut record = serde_json::to_value(&iflow).unwrap();
+        record["providerTypeId"] = serde_json::json!("IFLOW");
+        record["providerType"] = serde_json::json!("IFLOW");
+        let legacy = serde_json::json!({
+            "__operit_preferences_schema_version": "3",
+            "provider_list": "[\"iflow\"]",
+            "provider_iflow": serde_json::to_string(&record).unwrap()
+        });
+        host.writeBytes(path, &serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+        let expectedMigrationStep = std::sync::atomic::AtomicU32::new(3);
+        let store = CoreNodeStateStore::newWithStorage(host, path).withSchema(
+            ModelConfigManager::PREFERENCES_VERSION,
+            move |version, preferences| {
+                assert_eq!(
+                    version,
+                    expectedMigrationStep.load(std::sync::atomic::Ordering::SeqCst),
+                    "an older file must run its migrations in order"
+                );
+                expectedMigrationStep.store(version + 1, std::sync::atomic::Ordering::SeqCst);
+                ModelConfigManager::migratePreferences(version, preferences)
+            },
+        );
+        let migrated = store.data().unwrap();
+        let iflowRecord = migrated
+            .get(&stringPreferencesKey("provider_iflow"))
+            .unwrap();
+        assert_eq!(iflowRecord["providerTypeId"], "OTHER");
+        assert_eq!(iflowRecord["providerType"], "OTHER");
+        assert_eq!(
+            ModelConfigManager::readProviderList(&migrated).unwrap(),
+            vec!["iflow"]
+        );
+        assert_eq!(store.schemaVersion().unwrap(), 5);
+    }
+
     #[test]
     fn default_ids_are_model_ids() {
         assert_eq!(
             ModelConfigManager::DEFAULT_MODEL_ID,
             ModelConfigDefaults::DEFAULT_MODEL_ID
         );
+    }
+
+    #[test]
+    fn local_llm_settings_and_remote_inference_references_survive_hydration() {
+        use operit_local_models::{
+            LocalModelCatalog::LocalModelCatalog,
+            LocalModelRegistry::{InstalledLocalModel, LocalModelRegistrySnapshot},
+            LocalModelRegistryStore::LocalModelRegistryStore,
+        };
+        use operit_model::ModelConfigData::ModelProfile;
+        let root = unique_test_root("local_llm_settings");
+        setup_test_runtime(root.clone());
+        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
+        let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
+        let manifest = LocalModelCatalog::qwen3LlamaCpp();
+        let model_id = manifest.registryKey();
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.installedModels.push(InstalledLocalModel {
+            manifest,
+            storagePath: "runtime/models/local/chat/qwen".into(),
+            installedAtMs: 1,
+            verifiedAtMs: Some(1),
+        });
+        registry_store.write(&registry).unwrap();
+        let manager = ModelConfigManager::new(root.clone());
+        let mut model = manager.getModelProfile("LOCAL_MODEL", &model_id).unwrap();
+        assert!(!model.localRuntime.inferenceBindingKey.is_empty());
+        model.localRuntime.llamaThreadCount = 7;
+        model.localRuntime.llamaContextSize = 4096;
+        manager
+            .updateModelProfile("LOCAL_MODEL", model.clone())
+            .unwrap();
+        assert_eq!(
+            manager
+                .getModelProfile("LOCAL_MODEL", &model_id)
+                .unwrap()
+                .localRuntime,
+            model.localRuntime
+        );
+        operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
+            .unwrap()
+            .create("remote-llm", "model-device")
+            .unwrap();
+        let mut provider = manager.getProviderProfile("LOCAL_MODEL").unwrap();
+        let mut remote = ModelProfile::new("remote-model@revision".into());
+        remote.localRuntime.inferenceBindingKey = "remote-llm".into();
+        provider.models.push(remote.clone());
+        manager.saveProviderToDataStore(&provider).unwrap();
+        registry.installedModels.clear();
+        registry_store.write(&registry).unwrap();
+        let models = manager.getProviderProfile("LOCAL_MODEL").unwrap().models;
+        assert_eq!(models, vec![remote]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_model_installation_preserves_an_explicit_remote_inference_binding() {
+        use operit_local_models::{
+            LocalModelCatalog::LocalModelCatalog,
+            LocalModelRegistry::{InstalledLocalModel, LocalModelRegistrySnapshot},
+            LocalModelRegistryStore::LocalModelRegistryStore,
+        };
+        let root = unique_test_root("local_remote_model_collision");
+        setup_test_runtime(root.clone());
+        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
+        let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
+        let manifest = LocalModelCatalog::qwen3LlamaCpp();
+        let model_id = manifest.registryKey();
+        let mut registry = LocalModelRegistrySnapshot::empty();
+        registry.installedModels.push(InstalledLocalModel {
+            manifest,
+            storagePath: "runtime/models/local/chat/qwen".into(),
+            installedAtMs: 1,
+            verifiedAtMs: Some(1),
+        });
+        registry_store.write(&registry).unwrap();
+        let manager = ModelConfigManager::new(root.clone());
+        let local = manager.getModelProfile("LOCAL_MODEL", &model_id).unwrap();
+        assert!(!local.localRuntime.inferenceBindingKey.is_empty());
+        operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
+            .unwrap()
+            .create("remote-same-model", "remote-model-device")
+            .unwrap();
+        let mut remote = local.clone();
+        remote.localRuntime.inferenceBindingKey = "remote-same-model".into();
+        remote.localRuntime.llamaThreadCount = 7;
+        remote.localRuntime.llamaContextSize = 4096;
+        manager
+            .updateModelProfile("LOCAL_MODEL", remote.clone())
+            .unwrap();
+
+        // A fresh read must preserve the selected device even with identical local weights.
+        let reloaded = ModelConfigManager::new(root.clone());
+        assert_eq!(
+            reloaded.getModelProfile("LOCAL_MODEL", &model_id).unwrap(),
+            remote
+        );
+
+        // Removing and reinstalling this node's weights must not change the remote reference.
+        registry_store
+            .write(&LocalModelRegistrySnapshot::empty())
+            .unwrap();
+        assert_eq!(
+            reloaded.getModelProfile("LOCAL_MODEL", &model_id).unwrap(),
+            remote
+        );
+        registry_store.write(&registry).unwrap();
+        assert_eq!(
+            reloaded.getModelProfile("LOCAL_MODEL", &model_id).unwrap(),
+            remote
+        );
+
+        // An explicit change back to this node remains possible.
+        reloaded
+            .updateModelProfile("LOCAL_MODEL", local.clone())
+            .unwrap();
+        assert_eq!(
+            reloaded.getModelProfile("LOCAL_MODEL", &model_id).unwrap(),
+            local
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Verifies local provider hydration does not create a nested HTTP runtime.
@@ -1212,7 +1704,9 @@ mod tests {
         assert!(provider.endpoint.is_empty());
         let ids = manager.getProviderIds().expect("provider ids");
         assert!(ids.contains(&provider_id));
-        assert!(ids.iter().any(|id| id == ApiProviderType::LOCAL_MODEL.name()));
+        assert!(ids
+            .iter()
+            .any(|id| id == ApiProviderType::LOCAL_MODEL.name()));
 
         fs::remove_dir_all(root).expect("remove model config test root");
     }
@@ -1330,20 +1824,21 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Verifies creating a provider with an occupied name is rejected.
+    /// Verifies provider UUID allocation and rejects an occupied display name.
     #[test]
     fn create_provider_rejects_duplicate_name() {
         let root = unique_test_root("create_provider_rejects_duplicate_name");
         setup_test_runtime(root.clone());
         let manager = ModelConfigManager::new(root.clone());
 
-        manager
+        let providerId = manager
             .createProvider(
                 "Same provider name".to_string(),
                 "OPENAI".to_string(),
                 "https://api.openai.com/v1".to_string(),
             )
             .expect("first provider with this name");
+        assert!(uuid::Uuid::parse_str(&providerId).is_ok());
         let error = manager
             .createProvider(
                 "Same provider name".to_string(),
@@ -1497,6 +1992,12 @@ mod tests {
     }
 
     impl RuntimeStorageHost for TestRuntimeStorageHost {
+        /// Flushes the existing test file through its backing filesystem.
+        fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
+            std::fs::OpenOptions::new().write(true).open(self.resolve(path)?)?.sync_all()?;
+            Ok(())
+        }
+
         /// Returns the temporary runtime root.
         fn runtimeRootDir(&self) -> Option<PathBuf> {
             Some(self.root.clone())
@@ -1509,6 +2010,11 @@ mod tests {
 
         fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
             Ok(fs::read(self.resolve(path)?)?)
+        }
+
+        /// Atomically publishes one complete in-memory test entry.
+        fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
+            self.writeBytes(path, content)
         }
 
         fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {

@@ -13,12 +13,7 @@ RuntimeContext.register({
     loadSettings: shared_1.loadSettings,
     saveSettings: shared_1.saveSettings,
 });
-async function appendExtraInfoWithStatus(processedInput, chatId, activePrompt) {
-    return (0, shared_1.appendExtraInfoToMessage)(processedInput, chatId || undefined, activePrompt);
-}
-function resolveHookActivePrompt(input) {
-    return input.eventPayload.metadata?.activePrompt;
-}
+/** Registers the settings screen and prompt injection hooks. */
 function registerToolPkg() {
     ToolPkg.registerToolboxUiModule({
         id: "message_insert_settings",
@@ -44,6 +39,7 @@ function registerToolPkg() {
     });
     return true;
 }
+/** Injects persisted attachments before input processing when enabled. */
 async function onPromptInput(input) {
     const stage = String(input.eventPayload.stage ?? input.eventName ?? "");
     if (stage !== "before_process") {
@@ -57,10 +53,9 @@ async function onPromptInput(input) {
     if (!processedInput.trim()) {
         return null;
     }
-    const chatId = String(input.eventPayload.chatId ?? getChatId() ?? "").trim();
-    const activePrompt = resolveHookActivePrompt(input);
-    return appendExtraInfoWithStatus(processedInput, chatId || undefined, activePrompt);
+    return (0, shared_1.appendExtraInfoToMessage)(processedInput);
 }
+/** Injects transient attachments into the final model request when enabled. */
 async function onPromptFinalize(input) {
     const stage = String(input.eventPayload.stage ?? input.eventName ?? "");
     if (stage !== "before_send_to_model") {
@@ -74,10 +69,9 @@ async function onPromptFinalize(input) {
     if (!processedInput.trim()) {
         return null;
     }
-    const chatId = String(input.eventPayload.chatId ?? getChatId() ?? "").trim();
-    const activePrompt = resolveHookActivePrompt(input);
-    return appendExtraInfoWithStatus(processedInput, chatId || undefined, activePrompt);
+    return (0, shared_1.appendExtraInfoToMessage)(processedInput);
 }
+/** Reads or toggles the extra information injection menu state. */
 async function onInputMenuToggle(input) {
     const action = String(input.eventPayload.action ?? "").toLowerCase();
     if (action === "toggle") {

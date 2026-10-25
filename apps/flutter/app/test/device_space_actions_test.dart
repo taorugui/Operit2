@@ -13,7 +13,6 @@ import 'space_join_dialog_test.dart' show JoinBridge, joinRequest;
 class DeviceBridge extends JoinBridge {
   Map<String, Object?>? config = {
     'bindAddress': '0.0.0.0:37195',
-    'token': 'runtime-owned-token',
     'transports': ['http', 'webSocket'],
     'discoveryEnabled': true,
     'portMode': 'fixed',
@@ -21,6 +20,7 @@ class DeviceBridge extends JoinBridge {
   };
   Completer<Uint8List>? discovery;
   Map<String, Object?>? pairingArgs;
+  Map<String, Object?>? finishArgs;
   List<Map<String, Object?>> peers = [
     {
       'nodeId': 'ios',
@@ -46,6 +46,18 @@ class DeviceBridge extends JoinBridge {
             'pairingId': 'pair-1',
             'peerNodeId': 'ios',
             'displayName': '我的 iPhone',
+          },
+        ]);
+      case 'finishPairing':
+        calls.add(request.methodName);
+        finishArgs = Map<String, Object?>.from(request.args as Map);
+        return encodeCoreLink([
+          0,
+          {
+            'nodeId': 'ios',
+            'displayName': '我的 iPhone',
+            'inbound': false,
+            'outbound': true,
           },
         ]);
       case 'cancelPairing':
@@ -222,7 +234,7 @@ void main() {
     await tester.tap(find.text('通过地址连接'));
     await tester.pumpAndSettle();
     expect(find.byType(AlertDialog), findsOneWidget);
-    expect(find.byType(TextField), findsNWidgets(2));
+    expect(find.byType(TextField), findsOneWidget);
     await tester.tap(
       find.descendant(of: find.byType(AlertDialog), matching: find.text('取消')),
     );
@@ -242,6 +254,67 @@ void main() {
     expect(find.byType(OperitDialogScaffold), findsNothing);
     await dispose(tester, bridge);
   });
+  testWidgets(
+    'manual address pairing asks only for the address and confirmation code',
+    (tester) async {
+      final bridge = DeviceBridge();
+      await mount(tester, bridge);
+      await tester.tap(find.text('添加设备'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('通过地址连接'));
+      await tester.pumpAndSettle();
+      expect(find.byType(TextField), findsOneWidget);
+      await tester.enterText(
+        find.byType(TextField).first,
+        'http://192.168.1.2:37195',
+      );
+      await tester.tap(find.text('开始连接'));
+      await tester.pumpAndSettle();
+      expect(bridge.pairingArgs!['address'], 'http://192.168.1.2:37195');
+      expect(bridge.pairingArgs!.containsKey('token'), isFalse);
+      expect(find.text('配对码'), findsOneWidget);
+      expect(find.byType(TextField), findsNWidgets(2));
+      expect(
+        tester.widget<TextField>(find.byType(TextField).first).enabled,
+        isFalse,
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField).last).enabled,
+        isNot(false),
+      );
+      await dispose(tester, bridge);
+    },
+  );
+  testWidgets(
+    'remote address pairing sends only the receiving device confirmation code',
+    (tester) async {
+      final bridge = DeviceBridge();
+      await mount(tester, bridge);
+      await tester.tap(find.text('添加设备'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('通过地址连接'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byType(TextField).first,
+        'https://pair.example.com:37195',
+      );
+      await tester.tap(find.text('开始连接'));
+      await tester.pumpAndSettle();
+      expect(bridge.pairingArgs!['address'], 'https://pair.example.com:37195');
+      expect(
+        bridge.pairingArgs!.keys,
+        unorderedEquals(['nodeId', 'address', 'transport']),
+      );
+      await tester.enterText(find.byType(TextField).last, '123456');
+      await tester.tap(find.text('完成连接'));
+      await tester.pumpAndSettle();
+      expect(bridge.finishArgs, {
+        'pairingId': 'pair-1',
+        'confirmationCode': '123456',
+      });
+      await dispose(tester, bridge);
+    },
+  );
   testWidgets('device cards start pairing with the selected peer', (
     tester,
   ) async {
@@ -253,7 +326,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(bridge.pairingArgs!['address'], 'http://192.168.1.2:37195');
     expect(bridge.pairingArgs!['nodeId'], 'ios');
-    expect(bridge.pairingArgs!['token'], isNull);
+    expect(bridge.pairingArgs!.containsKey('token'), isFalse);
     expect(find.byType(AlertDialog), findsOneWidget);
     expect(find.byType(TextField), findsOneWidget);
     await tester.tap(
@@ -415,4 +488,83 @@ void main() {
       await dispose(tester, bridge);
     });
   }
+  testWidgets(
+    'pairing an admitted member ends at the direct link without a join request',
+    (tester) async {
+      final bridge = DeviceBridge();
+      await mount(tester, bridge);
+      await tester.tap(find.text('添加设备'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('我的 iPhone'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), '123456');
+      await tester.tap(find.text('完成连接'));
+      await tester.pumpAndSettle();
+      expect(bridge.finishArgs!['confirmationCode'], '123456');
+      expect(bridge.calls, isNot(contains('requestDeviceSpaceJoin')));
+      expect(find.text('已建立直连：我的 iPhone'), findsOneWidget);
+      await dispose(tester, bridge);
+    },
+  );
+  testWidgets('pairing a device outside the Space still asks to join', (
+    tester,
+  ) async {
+    final bridge = DeviceBridge()..members = <String>['mac'];
+    await mount(tester, bridge);
+    await tester.tap(find.text('添加设备'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('我的 iPhone'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '123456');
+    await tester.tap(find.text('完成连接'));
+    await tester.pumpAndSettle();
+    expect(bridge.calls, contains('requestDeviceSpaceJoin'));
+    expect(find.textContaining('已建立直连'), findsNothing);
+    await dispose(tester, bridge);
+  });
+  testWidgets('focused pairing dialog scans only the selected device', (
+    tester,
+  ) async {
+    final bridge = DeviceBridge()
+      ..peers = [
+        {
+          'nodeId': 'ios',
+          'displayName': '我的 iPhone',
+          'address': 'http://192.168.1.2:37195',
+        },
+        {
+          'nodeId': 'other',
+          'displayName': '其他设备',
+          'address': 'http://192.168.1.3:37195',
+        },
+      ];
+    await tester.pumpWidget(
+      MaterialApp(
+        locale: const Locale('zh'),
+        supportedLocales: AppLocalizations.supportedLocales,
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showDeviceSpacePairingDialog(
+                context,
+                clients: GeneratedCoreProxyClients(bridge),
+                title: '建立直连',
+                hint: '该设备已是本空间成员。',
+                onlyNodeId: 'ios',
+              ),
+              child: const Text('打开'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('打开'));
+    await tester.pumpAndSettle();
+    expect(find.text('建立直连'), findsOneWidget);
+    expect(find.text('该设备已是本空间成员。'), findsOneWidget);
+    expect(find.text('我的 iPhone'), findsOneWidget);
+    expect(find.text('其他设备'), findsNothing);
+    await dispose(tester, bridge);
+  });
 }

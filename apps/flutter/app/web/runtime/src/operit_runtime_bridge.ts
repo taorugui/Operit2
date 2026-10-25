@@ -1,3 +1,4 @@
+import { createBrowserJavaScriptHost } from "./operit_javascript_runtime.js";
 import { createBrowserHttpStreamHost } from "./browser_http_stream.js";
 import { openBrowserFile } from "./browser_file_open.js";
 import { captureBrowserScreen, readBrowserLocation, recognizeBrowserText,
@@ -116,10 +117,6 @@ interface RuntimeBridge {
 interface WasmBridgeModule {
   default(options: { module_or_path: string | URL }): Promise<{ memory: WebAssembly.Memory }>;
   OperitFlutterBridgeWasm: new () => RuntimeBridge;
-}
-
-interface WasiModule {
-  setWasiMemory(memory: WebAssembly.Memory): void;
 }
 
 interface WebDeviceInfo {
@@ -540,6 +537,8 @@ interface RuntimeWorkerStorageBridge {
   readRange(prefix: string, path: string, offset: number, length: number): Uint8Array;
   write(prefix: string, path: string, content: Uint8Array): void;
   append(prefix: string, path: string, content: Uint8Array): void;
+  /** Flushes one existing record through its worker-owned OPFS handles. */
+  flush(prefix: string, path: string): void;
   hasFile(prefix: string, path: string): boolean;
   exists(prefix: string, path: string): boolean;
   delete(prefix: string, path: string, recursive: boolean): void;
@@ -1756,8 +1755,19 @@ interface ModelInstallWorkerError {
     return key(runtimePrefix, path);
   }
 
+  /** Persists SQLite bytes while restoring the real foreign-key setting reset by sql.js export. */
   function saveSqliteDatabase(connection: SqliteConnection): void {
-    storageWrite(runtimePrefix, connection.path, connection.db.export());
+    const rows = querySqlite(connection.db, "PRAGMA foreign_keys", []);
+    if (rows.length !== 1 || rows[0].values.length !== 1) {
+      throw new Error("sqlite foreign_keys query did not return one value");
+    }
+    const foreignKeys = rows[0].values[0];
+    if (foreignKeys.kind !== "integer" || (foreignKeys.value !== "0" && foreignKeys.value !== "1")) {
+      throw new Error("sqlite foreign_keys query returned an invalid flag");
+    }
+    const bytes = connection.db.export();
+    connection.db.run(`PRAGMA foreign_keys = ${foreignKeys.value}`);
+    storageWrite(runtimePrefix, connection.path, bytes);
   }
 
   function sqliteConnection(id: string): SqliteConnection {
@@ -3933,6 +3943,7 @@ self.onmessage = (event) => {
   installWebLocalInferenceTestApi();
 
   runtimeGlobal.__operitHost = {
+    javaScriptRuntime: registerMainHostModule(createBrowserJavaScriptHost()),
     terminal: registerMainHostModule({
       /** Starts one browser-local Linux VM terminal session. */
       startPty(sessionId: string, rows: number, cols: number): void {
@@ -3979,6 +3990,14 @@ self.onmessage = (event) => {
       },
       appendBytes(path: string, content: Uint8Array): void {
         storageAppend(runtimePrefix, path, content);
+      },
+      /** Flushes existing OPFS bytes through the runtime worker storage host. */
+      flushFile(path: string): void {
+        const storage = runtimeGlobal.__operitRuntimeWorkerStorage;
+        if (storage === undefined) {
+          throw new Error("runtime worker OPFS storage is not installed");
+        }
+        storage.flush(runtimePrefix, path);
       },
       delete(path: string, recursive: boolean): void {
         storageDelete(runtimePrefix, path, recursive);
@@ -4176,11 +4195,13 @@ self.onmessage = (event) => {
         connection.db.exec(sql);
         saveSqliteDatabase(connection);
       },
+      /** Captures the actual affected-row count before export resets sql.js connection counters. */
       execute(id: string, sql: string, params: SqliteParameter[]): number {
         const connection = sqliteConnection(id);
         connection.db.run(sql, sqliteParams(params));
+        const changedRows = connection.db.getRowsModified();
         saveSqliteDatabase(connection);
-        return connection.db.getRowsModified();
+        return changedRows;
       },
       query(id: string, sql: string, params: SqliteParameter[]): SqliteQueryRow[] {
         return querySqlite(sqliteConnection(id).db, sql, params);
@@ -4216,10 +4237,30 @@ self.onmessage = (event) => {
           ? value.value
           : "0";
       },
+      /** Commits once, aborts a rejected COMMIT explicitly, and never hides persistence errors. */
       commitTransaction(id: string): void {
         const connection = sqliteTransaction(id);
-        connection.db.run("COMMIT");
+        try {
+          connection.db.run("COMMIT");
+        } catch (commitError) {
+          try {
+            connection.db.run("ROLLBACK");
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [commitError, rollbackError],
+              `SQLite COMMIT failed: ${String(commitError)}; explicit ROLLBACK failed: ${String(rollbackError)}`,
+            );
+          }
+          sqliteTransactions.delete(id);
+          throw commitError;
+        }
+        sqliteTransactions.delete(id);
         saveSqliteDatabase(connection);
+      },
+      /** Aborts the exact live transaction without exporting or persisting its uncommitted changes. */
+      rollbackTransaction(id: string): void {
+        const connection = sqliteTransaction(id);
+        connection.db.run("ROLLBACK");
         sqliteTransactions.delete(id);
       },
     }),
@@ -4546,20 +4587,18 @@ self.onmessage = (event) => {
 
   let bridgePromise: Promise<RuntimeBridge> | null = null;
 
-  /** Initializes the WebAssembly bridge with its browser WASI host. */
+  /** Initializes the browser WebAssembly bridge and its required storage hosts. */
   async function initializeWasmBridge(
     module: WasmBridgeModule,
-    wasi: WasiModule,
   ): Promise<RuntimeBridge> {
     await ensureBrowserStorage();
     await ensureSqlite();
     if (isMainRuntimeHost()) {
       await ensureWebLocalInference();
     }
-    const wasm = await module.default({
+    await module.default({
       module_or_path: new URL("./operit_flutter_bridge_bg.wasm", import.meta.url),
     });
-    wasi.setWasiMemory(wasm.memory);
     return new module.OperitFlutterBridgeWasm();
   }
 
@@ -4569,9 +4608,7 @@ self.onmessage = (event) => {
         ? "./operit_flutter_bridge_worker.js"
         : "./operit_flutter_bridge.js";
       const wasmModule = importRuntimeScript(wasmModulePath) as Promise<WasmBridgeModule>;
-      const wasiModule = importRuntimeScript("./wasi_snapshot_preview1.js") as Promise<WasiModule>;
-      bridgePromise = Promise.all([wasmModule, wasiModule])
-        .then(([module, wasi]) => initializeWasmBridge(module, wasi));
+      bridgePromise = wasmModule.then(initializeWasmBridge);
     }
     return bridgePromise;
   }

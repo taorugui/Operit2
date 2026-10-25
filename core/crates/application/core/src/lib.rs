@@ -15,7 +15,8 @@ use operit_plugin_sdk_ipc::PluginSdkLinkTarget;
 use operit_plugin_sdk_ipc_bridge::OperitPluginSdkIpcBridge;
 use operit_runtime::core::application::OperitApplication::OperitApplication;
 
-mod edge_tools;
+mod device_tools;
+mod device_transport;
 
 type LocalClientConfigurator = Box<dyn FnOnce(&mut LocalCoreProxy) -> Result<(), String> + Send>;
 
@@ -129,10 +130,13 @@ impl CoreApplication {
     ) -> Result<Self, String> {
         let nodeRuntime = localClient.coreNodeLocalRuntime();
         let nodeRouter = Arc::new(CoreNodeRouter::new(nodeRuntime.clone()));
-        // Reduced/test hosts may omit asynchronous hardware support. Do not
-        // break Core startup or invent a global scheduler; port calls then fail explicitly.
+        nodeRouter.bindDeviceToolService(localClient.deviceToolService())?;
+        // Reduced/test hosts may omit task scheduling. Device calls then fail
+        // explicitly, while Core startup and synchronous local tools remain available.
         if let Some(scheduler) = localClient.hostManager().hostRuntimeTaskSchedulerHost.clone() {
-            localClient.bindEdgeToolRuntime(Arc::new(edge_tools::CoreEdgeToolRuntime::new(Arc::downgrade(&nodeRouter), scheduler)))?;
+            localClient.bindDeviceToolRuntime(Arc::new(device_tools::CoreDeviceToolRuntime::new(
+                Arc::downgrade(&nodeRouter), scheduler,
+            )))?;
         }
         let accessServices = RuntimeRemoteLinkService::newWithRouter(
             nodeRuntime.clone(), (*nodeRouter).clone(),
@@ -153,15 +157,17 @@ impl CoreApplication {
             .hostManager()
             .pluginSdkIpcHost
             .clone()
-            .map(|host| {
+            .map(|host| -> Result<OperitPluginSdkIpcBridge, String> {
+                let scheduler = localClient.hostManager().hostRuntimeTaskSchedulerHost.clone().ok_or("Plugin SDK IPC requires a Host task scheduler")?;
                 let target: Arc<dyn PluginSdkLinkTarget> = nodeRouter.clone();
-                OperitPluginSdkIpcBridge::new(
+                Ok(OperitPluginSdkIpcBridge::new(
                     host,
+                    scheduler,
                     PluginSdkIpcEndpoint::standard(),
                     target,
                     operit_proxy_local::pluginSdkSurface(),
-                )
-            });
+                ))
+            }).transpose()?;
         if let Some(bridge) = &pluginSdkIpcBridge {
             bridge.start().map_err(|error| error.to_string())?;
         }
@@ -187,12 +193,6 @@ impl CoreApplication {
     /// 未装配核心时明确报错，不把缺失服务伪装成配对成功。
     pub fn nodeServices(&self) -> Result<NodeServices, String> {
         self.nodeRouter.nodeServices().cloned()
-    }
-
-    /// 本机管理入口，不能注册为远端 Link Call，也不能出现在普通状态快照中。
-    pub fn localPairingToken(&self) -> Result<String, String> {
-        operit_node_runtime::PeerStateStore::PeerStateStore::new(self.nodeRuntime.runtimeStorageHost())
-            .localPairingToken()
     }
 
     /// Returns the generated local Core client entry point.
@@ -241,6 +241,7 @@ impl CoreApplication {
             let _ = bridge.stop();
         }
         let _ = self.accessServices.stopSpaceSync();
+        self.localClient.shutdownToolPkgExecutionEngines();
         operit_link::clearCoreRouteRuntime();
     }
 }
@@ -252,5 +253,9 @@ impl Drop for CoreApplication {
             let _ = bridge.stop();
         }
         let _ = self.accessServices.stopSpaceSync();
+        self.localClient.shutdownToolPkgExecutionEngines();
     }
 }
+
+#[cfg(test)]
+mod speech_transport_tests;

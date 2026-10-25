@@ -92,6 +92,12 @@ impl RuntimeStorageHost for WebRuntimeStorageHost {
         Ok(())
     }
 
+    /// Flushes the worker-owned OPFS data and index without copying the record.
+    fn flushFile(&self, path: &str) -> HostResult<()> {
+        call_storage("flushFile", &[JsValue::from_str(path)])?;
+        Ok(())
+    }
+
     fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
         call_storage(
             "delete",
@@ -285,6 +291,12 @@ impl RuntimeSqliteTransaction for WebRuntimeSqliteTransaction {
 
     fn commit(self: Box<Self>) -> HostResult<()> {
         call_sqlite("commitTransaction", &[JsValue::from_str(&self.id)])?;
+        Ok(())
+    }
+
+    /// Aborts the exact browser transaction through the registered JavaScript SQLite host.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        call_sqlite("rollbackTransaction", &[JsValue::from_str(&self.id)])?;
         Ok(())
     }
 }

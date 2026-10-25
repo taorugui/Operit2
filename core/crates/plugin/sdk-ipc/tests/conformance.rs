@@ -4,17 +4,16 @@ use async_trait::async_trait;
 use operit_host_api::PluginSdkIpcEndpoint;
 use operit_host_native_plugin_sdk_ipc::MemoryPluginSdkIpcHost;
 use operit_link::{
-    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream,
-    CoreLinkError, CoreLinkPushSession, CorePushRequest, CoreValue, CoreWatchRequest,
+    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkError,
+    CoreLinkPushSession, CoreLinkSharedClient, CorePushRequest, CoreValue, CoreWatchRequest,
 };
-use operit_plugin_sdk_ipc::{PluginSdkClient, PluginSdkIpcServer, PluginSdkLinkTarget};
+use operit_plugin_sdk_ipc::{PluginSdkClient, PluginSdkIpcServer};
 
-/// Provides deterministic Core Link behavior for the cross-process conformance test.
-#[derive(Clone)]
+/// Provides deterministic shared Link behavior without mutable ownership or client cloning.
 struct TestCoreLinkTarget;
 
 #[async_trait(?Send)]
-impl PluginSdkLinkTarget for TestCoreLinkTarget {
+impl CoreLinkSharedClient for TestCoreLinkTarget {
     /// Returns the input argument through the canonical call response.
     async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
         CoreCallResponse::ok(request.requestId, request.args)
@@ -101,6 +100,7 @@ fn pair() -> (
     let endpoint = PluginSdkIpcEndpoint::standard();
     let server = PluginSdkIpcServer::new(
         host.clone(),
+        Arc::new(operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new()),
         endpoint.clone(),
         Arc::new(TestCoreLinkTarget),
         {
@@ -116,6 +116,7 @@ fn pair() -> (
     (host, client, server)
 }
 
+/// Exercises all Link families through a shared client and a shared-only IPC target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forwards_call_watch_snapshot_watch_and_push() {
     let (_host, client, server) = pair();
@@ -128,7 +129,10 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
             CoreValue::String("value".to_string()),
         ))
         .await;
-    assert_eq!(call.result.expect("call succeeds"), CoreValue::String("value".to_string()));
+    assert_eq!(
+        call.result.expect("call succeeds"),
+        CoreValue::String("value".to_string())
+    );
 
     let snapshot = client
         .watchSnapshot(CoreWatchRequest::new(
@@ -150,12 +154,22 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
         ))
         .await
         .expect("watch opens");
-    assert_eq!(stream.recv().await.expect("snapshot event").kind, CoreEventKind::Snapshot);
-    assert_eq!(stream.recv().await.expect("changed event").kind, CoreEventKind::Changed);
-    assert_eq!(stream.recv().await.expect("completed event").kind, CoreEventKind::Completed);
+    assert_eq!(
+        stream.recv().await.expect("snapshot event").kind,
+        CoreEventKind::Snapshot
+    );
+    assert_eq!(
+        stream.recv().await.expect("changed event").kind,
+        CoreEventKind::Changed
+    );
+    assert_eq!(
+        stream.recv().await.expect("completed event").kind,
+        CoreEventKind::Completed
+    );
     drop(stream);
 
-    let mut push = client
+    let shared: &dyn CoreLinkSharedClient = &client;
+    let mut push = shared
         .openPush(CorePushRequest::new("push-1", "core/test", "input"))
         .await
         .expect("push opens");
@@ -172,8 +186,16 @@ async fn forwards_call_watch_snapshot_watch_and_push() {
 async fn rejects_unexposed_route() {
     let (_host, client, server) = pair();
     let response = client
-        .call(CoreCallRequest::new("blocked-1", "core/test", "privateMethod", CoreValue::Null))
+        .call(CoreCallRequest::new(
+            "blocked-1",
+            "core/test",
+            "privateMethod",
+            CoreValue::Null,
+        ))
         .await;
-    assert_eq!(response.result.expect_err("route must be rejected").code, "PLUGIN_SDK_ROUTE_NOT_EXPOSED");
+    assert_eq!(
+        response.result.expect_err("route must be rejected").code,
+        "PLUGIN_SDK_ROUTE_NOT_EXPOSED"
+    );
     server.stop().expect("server stops");
 }

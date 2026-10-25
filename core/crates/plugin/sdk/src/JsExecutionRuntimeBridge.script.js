@@ -1,27 +1,63 @@
 /** Installs the structured tool transport and its owning-call lifecycle. */
 (function() {
     var root = globalThis;
+    // Capture the ownership primitives before plugin code can replace them.
+    var ownKeys = Reflect.ownKeys;
+    var getPrototypeOf = Object.getPrototypeOf;
+    var setPrototypeOf = Object.setPrototypeOf;
+    var getDescriptor = Object.getOwnPropertyDescriptor;
+    var createObject = Object.create;
+    var isArray = Array.isArray;
+    var isFiniteNumber = Number.isFinite;
+    var objectPrototype = Object.prototype;
+    var arrayPrototype = Array.prototype;
+    var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
 
     /** Converts tool identity and error fields to text. */
     function asString(value) {
         return value == null ? '' : String(value);
     }
 
-    /** Copies tool parameters into safe own data properties. */
+    /** Snapshots plain data once without per-field output descriptor allocations. */
+    function snapshotJsonObject(value) {
+        if (value === null || typeof value !== 'object' || isArray(value)) throw new TypeError('Tool parameters must be a JSON object');
+        var ancestors = [], nodes = 0;
+        /** Builds into a private null-prototype target so assignments cannot invoke inherited setters. */
+        function copy(entry, depth) {
+            if (++nodes > 1000000 || depth > 128) throw new TypeError('Tool request exceeds structured depth/node limit');
+            if (entry === null || typeof entry === 'string' || typeof entry === 'boolean') return entry;
+            if (typeof entry === 'number' && isFiniteNumber(entry)) return entry;
+            var array = isArray(entry);
+            if (typeof entry !== 'object' || (!array && getPrototypeOf(entry) !== objectPrototype && getPrototypeOf(entry) !== null)) throw new TypeError('Tool request contains a non-JSON value');
+            for (var ancestor = 0; ancestor < ancestors.length; ancestor++) {
+                if (ancestors[ancestor] === entry) throw new TypeError('Tool request contains a cyclic value');
+            }
+            // The traversal stack is private too; inherited Array setters must
+            // not intercept writes after a plugin changes Array.prototype.
+            ancestors[ancestors.length] = entry;
+            var result = array ? setPrototypeOf([], null) : createObject(null);
+            var keys = ownKeys(entry), length = array ? entry.length : 0;
+            if (array && keys.length !== length + 1) throw new TypeError('Tool request contains non-JSON array properties');
+            for (var index = 0; index < keys.length; index++) {
+                var key = keys[index];
+                if (array && key === 'length') continue;
+                if (typeof key !== 'string') throw new TypeError('Tool request contains a non-JSON key');
+                var descriptor = getDescriptor(entry, key);
+                if (!descriptor || !descriptor.enumerable || !hasOwn(descriptor, 'value')) throw new TypeError('Tool request contains a non-JSON property');
+                if (array && ((key >>> 0) >= length || '' + (key >>> 0) !== key)) throw new TypeError('Tool request contains a non-JSON array hole or property');
+                result[key] = copy(descriptor.value, depth + 1);
+            }
+            ancestors.length--;
+            return setPrototypeOf(result, array ? arrayPrototype : objectPrototype);
+        }
+        setPrototypeOf(ancestors, null);
+        return copy(value, 0);
+    }
+
+    /** Captures the request once in its final host-owned representation. */
     function clonePlainObject(value) {
         if (value === undefined) return {};
-        if (!value || typeof value !== 'object' || Array.isArray(value)) {
-            throw new TypeError('Tool params must be a JSON object');
-        }
-        var copy = {};
-        var keys = Object.keys(value);
-        for (var i = 0; i < keys.length; i += 1) {
-            // Match JSON data properties; never invoke __proto__'s setter.
-            Object.defineProperty(copy, keys[i], {
-                value: value[keys[i]], enumerable: true, writable: true, configurable: true
-            });
-        }
-        return copy;
+        return root.__operitHostSnapshotJsonObject(value);
     }
 
     /** Rejects callback streaming that the tool execution host does not implement. */
@@ -67,7 +103,7 @@
             throw new TypeError('Tool host returned an invalid result envelope');
         }
         if (!result.success) {
-            throw new Error(asString(result.message).trim());
+            throw new Error(asString(result.message));
         }
         return result.data;
     }
@@ -124,12 +160,81 @@
                 throw new Error('Required host binding __operitNativeCallToolStructured is unavailable');
             }
             return invokeHostAsync(root.__operitNativeCallToolStructured,
-                [parsed.type, parsed.name, parsed.params], parseToolResult);
+                [parsed.type, parsed.name, parsed.params, String(root.__operitCurrentCallId)], parseToolResult);
         } catch (error) {
             return Promise.reject(error);
         }
     }
 
+    root.__operitExpose('__operitSnapshotJsonObject', snapshotJsonObject);
+    var deviceInvocationSequence = 0;
+
+    /** Executes an explicit-device request without placing routing metadata in tool parameters. */
+    function deviceToolCall(nodeId, toolType, toolName, params, options, action) {
+        try {
+            validateOptions(options);
+            options = options || {};
+            var signal = options.signal;
+            if (signal !== undefined && (!signal || typeof signal.aborted !== 'boolean' ||
+                typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) {
+                throw new TypeError('Device signal must be an AbortSignal');
+            }
+            if (signal && signal.aborted) throw new Error('Device tool call cancelled');
+            var invocationId = String(root.__operitCurrentCallId) + ':' + Date.now().toString(36) +
+                ':' + (++deviceInvocationSequence) + ':' + Math.random().toString(36).slice(2);
+            var metadata = {nodeId: nodeId, invocationId: invocationId,
+                action: action || 'execute', timeoutMs: options.timeoutMs === undefined ? 120000 : options.timeoutMs};
+            if (typeof root.__operitNativeCallToolStructured !== 'function') {
+                throw new Error('Required host binding __operitNativeCallToolStructured is unavailable');
+            }
+            return new Promise(function(resolve, reject) {
+                var settled = false;
+                var cancellations = options.__deviceCancellations;
+                /** Releases signal and view cancellation registrations after settlement. */
+                function cleanup() {
+                    if (signal) signal.removeEventListener('abort', abort);
+                    if (cancellations) {
+                        var index = cancellations.indexOf(abort);
+                        if (index !== -1) cancellations.splice(index, 1);
+                    }
+                }
+                /** Cancels this exact device invocation and settles its public Promise. */
+                function abort() {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    var cancel = {nodeId: nodeId, invocationId: invocationId, action: 'cancel', timeoutMs: metadata.timeoutMs};
+                    invokeHostAsync(root.__operitNativeCallToolStructured,
+                        ['default', '__device_cancel', {}, String(root.__operitCurrentCallId), cancel], parseToolResult).catch(function() {});
+                    reject(new Error('Device tool call cancelled'));
+                }
+                var pending = invokeHostAsync(root.__operitNativeCallToolStructured,
+                    [toolType, toolName, clonePlainObject(params), String(root.__operitCurrentCallId), metadata], parseToolResult);
+                if (cancellations) cancellations.push(abort);
+                if (signal) {
+                    signal.addEventListener('abort', abort, {once: true});
+                    if (signal.aborted) abort();
+                }
+                pending.then(function(value) {
+                    if (settled) {
+                        // An opening can win the remote race after local cancellation.
+                        if (action === 'transport' && params.op === 'open' && value && value.handle) {
+                            invokeHostAsync(root.__operitNativeCallToolStructured,
+                                ['default', '__device_transport', {op:'close',handle:value.handle}, String(root.__operitCurrentCallId),
+                                    {nodeId:nodeId,invocationId:invocationId+':close',action:'transport',timeoutMs:metadata.timeoutMs}], parseToolResult).catch(function() {});
+                        }
+                        return;
+                    }
+                    settled = true; cleanup(); resolve(value);
+                }, function(error) {
+                    if (settled) return;
+                    settled = true; cleanup(); reject(error);
+                });
+            });
+        } catch (error) { return Promise.reject(error); }
+    }
+
+    root.__operitExpose('__operitDeviceToolCall', deviceToolCall);
     root.__operitExpose('__operitInvokeHostAsync', invokeHostAsync);
     root.__operitExpose('toolCall', toolCall);
 })();

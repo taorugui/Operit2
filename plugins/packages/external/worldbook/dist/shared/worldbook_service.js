@@ -650,8 +650,9 @@ async function toggleWorldBookEntry(id) {
     return toWorldBookListEntry(nextEntry);
 }
 async function listWorldBookCharacterCards() {
-    const result = await Tools.Chat.listCharacterCards();
-    const cards = Array.isArray(result?.cards) ? result.cards : [];
+    const cards = await ToolPkg.callDependency("com.operit.character_cards", "character.list", {});
+    if (!Array.isArray(cards))
+        throw new Error("Character plugin returned an invalid directory");
     return cards
         .map((card) => ({
         id: String(card?.id || "").trim(),
@@ -757,4 +758,3 @@ async function updateWorldBookGroup(params) {
     await (0, worldbook_storage_js_1.writeWorldBookGroups)(groups);
     return groups[index];
 }
-void (0, worldbook_storage_js_1.ensureWorldBookStorage)();

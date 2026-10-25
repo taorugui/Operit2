@@ -1,10 +1,20 @@
 #![allow(non_snake_case)]
 
 pub mod DartPort;
+pub mod SharedBuffer;
 
-#[cfg(all(feature = "serial", not(any(target_os = "ios", target_os = "espidf", target_arch = "wasm32"))))]
+#[cfg(feature = "daemon")]
+pub mod DaemonHost;
+
+#[cfg(all(
+    feature = "serial",
+    not(any(target_os = "ios", target_os = "espidf", target_arch = "wasm32"))
+))]
 mod SerialPort;
-#[cfg(all(feature = "serial", not(any(target_os = "ios", target_os = "espidf", target_arch = "wasm32"))))]
+#[cfg(all(
+    feature = "serial",
+    not(any(target_os = "ios", target_os = "espidf", target_arch = "wasm32"))
+))]
 pub use SerialPort::NativeSerialPortHost;
 
 #[cfg(feature = "fs")]
@@ -15,12 +25,10 @@ pub use operit_host_native_http::{NativeHttpHost, NativeHttpServerHost};
 pub use operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost;
 #[cfg(all(feature = "scheduler", not(target_arch = "wasm32")))]
 pub use operit_host_native_scheduler::NativeHostRuntimeEventSchedulerHost;
-#[cfg(all(feature = "scheduler", not(target_arch = "wasm32")))]
-pub use operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost;
 #[cfg(feature = "storage")]
 pub use operit_host_native_storage::NativeArchiveStagingHost;
 #[cfg(feature = "storage")]
-pub use operit_host_native_storage::NativeRuntimeStorageHost;
+pub use operit_host_native_storage::{NativeFileSecretStore, NativeRuntimeStorageHost};
 #[cfg(feature = "terminal")]
 pub use operit_host_native_terminal::{NativePtyShellCommand, NativePtyTerminalHost};
 #[cfg(feature = "terminal")]
@@ -31,7 +39,19 @@ pub use ManagedRuntimePty::{TerminalManagedRuntimeLaunch, TerminalManagedRuntime
 #[cfg(not(any(target_os = "espidf", target_arch = "wasm32")))]
 pub mod ServiceDiscovery;
 
-#[cfg(all(feature = "tcp", not(any(target_os = "espidf", target_arch = "wasm32"))))]
+#[cfg(all(
+    feature = "tcp",
+    not(any(target_os = "espidf", target_arch = "wasm32"))
+))]
 pub mod Tcp;
-#[cfg(all(feature = "tcp", not(any(target_os = "espidf", target_arch = "wasm32"))))]
+#[cfg(all(
+    feature = "tcp",
+    not(any(target_os = "espidf", target_arch = "wasm32"))
+))]
 pub use Tcp::NativeTcpHost;
+
+#[cfg(not(any(target_os = "espidf", target_arch = "wasm32")))]
+pub use operit_host_native_scheduler::{
+    scheduleNativeBlockingTask, scheduleNativeServiceTask, scheduleNativeServiceTasks,
+    NativeHostRuntimeTaskSchedulerHost, NativeTaskHandle,
+};

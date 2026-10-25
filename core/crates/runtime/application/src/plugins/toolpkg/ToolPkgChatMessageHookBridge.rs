@@ -21,16 +21,12 @@ impl ToolPkgChatMessageHookBridge {
     /// Registers chat message persistence hooks for one application runtime.
     pub fn register(runtime: ToolPkgBridgeRuntime) {
         CHAT_MESSAGE_RUNTIME.get_or_init(|| runtime.clone());
-        let manager = runtime.package_manager();
-        manager.addToolPkgRuntimeChangeListener(std::sync::Arc::new(|activeContainers| {
-            ToolPkgChatMessageHookBridge::syncToolPkgRegistrations(activeContainers);
-        }));
     }
 
     /// Synchronizes active chat message hook registrations from enabled ToolPkg containers.
     #[allow(non_snake_case)]
-    pub fn syncToolPkgRegistrations(activeContainers: Vec<ToolPkgContainerRuntime>) {
-        let mut hooks = activeContainers
+    pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
+        let hooks = activeContainers
             .iter()
             .flat_map(|runtime| {
                 runtime
@@ -44,11 +40,6 @@ impl ToolPkgChatMessageHookBridge {
                     })
             })
             .collect::<Vec<_>>();
-        hooks.sort_by(|left, right| {
-            left.containerPackageName
-                .cmp(&right.containerPackageName)
-                .then(left.hookId.cmp(&right.hookId))
-        });
         *CHAT_MESSAGE_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
@@ -81,7 +72,7 @@ impl ToolPkgChatMessageHookBridge {
                     let eventPayload = buildChatMessagePayload(chatId, message);
                     let manager = runtime.package_manager();
                     for hook in activeHooks {
-                        ChainLogger::info(
+                        ChainLogger::verbose_with_level(
                             PLUGIN_CHAIN,
                             "plugin.toolpkg.chat_message.run.start",
                             &[
@@ -90,6 +81,7 @@ impl ToolPkgChatMessageHookBridge {
                                 ("hookId", hook.hookId.clone()),
                                 ("function", hook.functionName.clone()),
                             ],
+                            operit_util::AppLogger::VERBOSE_LEVEL_3,
                         );
                         match manager
                             .runToolPkgMainHook(
@@ -106,7 +98,7 @@ impl ToolPkgChatMessageHookBridge {
                             )
                             .await
                         {
-                            Ok(_) => ChainLogger::info(
+                            Ok(_) => ChainLogger::verbose_with_level(
                                 PLUGIN_CHAIN,
                                 "plugin.toolpkg.chat_message.run.done",
                                 &[
@@ -114,6 +106,7 @@ impl ToolPkgChatMessageHookBridge {
                                     ("package", hook.containerPackageName.clone()),
                                     ("hookId", hook.hookId.clone()),
                                 ],
+                                operit_util::AppLogger::VERBOSE_LEVEL_3,
                             ),
                             Err(error) => ChainLogger::error(
                                 PLUGIN_CHAIN,

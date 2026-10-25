@@ -8,13 +8,17 @@ use serde::Serialize;
 pub(crate) fn decode_native_call_request(
     request_bytes: &[u8],
 ) -> Result<CoreCallRequest, CoreLinkError> {
-    let (request_id, object_id, method_name, args): (String, String, String, operit_link::CoreValue) =
-        operit_link::decodeLink(request_bytes).map_err(|error| {
-            CoreLinkError::new(
-                "flutter-bridge-invalid-request",
-                format!("invalid compact core request: {error}"),
-            )
-        })?;
+    let (request_id, object_id, method_name, args): (
+        String,
+        String,
+        String,
+        operit_link::CoreValue,
+    ) = operit_link::decodeLink(request_bytes).map_err(|error| {
+        CoreLinkError::new(
+            "flutter-bridge-invalid-request",
+            format!("invalid compact core request: {error}"),
+        )
+    })?;
     Ok(CoreCallRequest::new(
         request_id,
         object_id,
@@ -27,13 +31,17 @@ pub(crate) fn decode_native_call_request(
 pub(crate) fn decode_native_push_open_request(
     request_bytes: &[u8],
 ) -> Result<CorePushRequest, CoreLinkError> {
-    let (request_id, object_id, method_name, args): (String, String, String, operit_link::CoreValue) =
-        operit_link::decodeLink(request_bytes).map_err(|error| {
-            CoreLinkError::new(
-                "flutter-bridge-invalid-request",
-                format!("invalid compact push-open request: {error}"),
-            )
-        })?;
+    let (request_id, object_id, method_name, args): (
+        String,
+        String,
+        String,
+        operit_link::CoreValue,
+    ) = operit_link::decodeLink(request_bytes).map_err(|error| {
+        CoreLinkError::new(
+            "flutter-bridge-invalid-request",
+            format!("invalid compact push-open request: {error}"),
+        )
+    })?;
     Ok(CorePushRequest::new(request_id, object_id, method_name).withArgs(args))
 }
 
@@ -103,19 +111,29 @@ pub(crate) fn native_result_vec<T>(result: Result<T, CoreLinkError>) -> Vec<u8>
 where
     T: Serialize,
 {
+    let mut bytes = Vec::new();
+    native_result_into(result, &mut bytes);
+    bytes
+}
+
+/// Encodes a result directly after any header already present in the destination.
+fn native_result_into<T: Serialize>(result: Result<T, CoreLinkError>, bytes: &mut Vec<u8>) {
     match result {
-        Ok(value) => operit_link::encodeLink((0u8, value))
+        Ok(value) => operit_link::codec::appendLink((0u8, value), bytes)
             .expect("compact native success response must encode"),
-        Err(error) => operit_link::encodeLink((
-            1u8,
-            error.code,
-            error.message,
-            error.details,
-            error
-                .location
-                .map(|location| (location.file, location.line, location.column)),
-            error.backtrace,
-        ))
+        Err(error) => operit_link::codec::appendLink(
+            (
+                1u8,
+                error.code,
+                error.message,
+                error.details,
+                error
+                    .location
+                    .map(|location| (location.file, location.line, location.column)),
+                error.backtrace,
+            ),
+            bytes,
+        )
         .expect("compact native error response must encode"),
     }
 }
@@ -127,8 +145,109 @@ pub(crate) fn native_result_error_vec(code: &str, message: impl Into<String>) ->
 
 /// Encodes one compact CoreProxy watch channel event.
 pub(crate) fn native_watch_event_vec(subscription_id: &str, event: CoreEvent) -> Vec<u8> {
-    operit_link::encodeLink((subscription_id, native_watch_event_payload(event)))
-        .expect("compact native watch event must encode")
+    let mut bytes = Vec::new();
+    native_watch_event_into(subscription_id, event, &mut bytes);
+    bytes
+}
+
+/// Serializes a watch event once into its final destination, retaining profiling.
+fn native_watch_event_into(subscription_id: &str, event: CoreEvent, bytes: &mut Vec<u8>) {
+    let profile = std::env::var_os("OPERIT_PROFILE_COMPOSE_STAGES").is_some();
+    let started = profile.then(std::time::Instant::now);
+    operit_link::codec::appendLink((subscription_id, native_watch_event_payload(event)), bytes)
+        .expect("compact native watch event must encode");
+    if let Some(started) = started {
+        let line = format!("event=compose_pipeline_stage stage=rust-messagepack durationMs={:.3} wallMicros={} bytes={}\n",
+            started.elapsed().as_secs_f64() * 1000.0,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros(), bytes.len());
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
+    }
+}
+
+/// Owns ABI-v3 control metadata and retained shared binary allocations.
+pub(crate) struct NativeFrame(Vec<u8>, Vec<operit_link::CoreBytes>);
+
+impl NativeFrame {
+    /// Creates the unchanged nine-byte header for one delivery.
+    pub(crate) fn empty(kind: u8, request: i64) -> Self {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.push(kind);
+        bytes.extend_from_slice(&request.to_le_bytes());
+        Self(bytes, Vec::new())
+    }
+
+    /// Encodes one reply directly into the allocation transferred to Dart.
+    pub(crate) fn result<T: Serialize>(
+        kind: u8,
+        request: i64,
+        result: Result<T, CoreLinkError>,
+    ) -> Self {
+        let mut frame = Self::empty(kind, request);
+        let (_, buffers) = operit_link::codec::captureLinkBuffers(|| native_result_into(result, &mut frame.0));
+        frame.1 = buffers;
+        frame
+    }
+
+    /// Encodes an explicit operation failure into its final reply frame.
+    pub(crate) fn error(kind: u8, request: i64, code: &str, message: impl Into<String>) -> Self {
+        Self::result(
+            kind,
+            request,
+            Err::<(), _>(CoreLinkError::new(code, message.into())),
+        )
+    }
+
+    /// Encodes one watch event into its final shared allocation.
+    pub(crate) fn watch(request: i64, subscription_id: &str, event: CoreEvent) -> Self {
+        let mut frame = Self::empty(1, request);
+        let (_, buffers) = operit_link::codec::captureLinkBuffers(|| native_watch_event_into(subscription_id, event, &mut frame.0));
+        frame.1 = buffers;
+        frame
+    }
+
+    /// Transfers the complete allocation without moving its payload bytes.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<operit_link::CoreBytes>) {
+        (self.0, self.1)
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// Verifies direct frame encoding preserves every ABI header and result byte.
+    #[test]
+    fn direct_frames_preserve_success_error_and_watch_bytes() {
+        let value = operit_link::CoreValue::Bytes(vec![0xa5; 1024 * 1024].into());
+        let (frame, buffers) = NativeFrame::result(0, -17, Ok(&value)).into_parts();
+        assert_eq!(frame[0], 0);
+        assert_eq!(&frame[1..9], &(-17i64).to_le_bytes());
+        assert!(frame.len() < 64);
+        let decoded: (u8, operit_link::CoreValue) = operit_link::codec::withLinkBuffers(buffers.clone().into(), || operit_link::decodeLink(&frame[9..]).unwrap());
+        assert_eq!(decoded, (0, value.clone()));
+        let operit_link::CoreValue::Bytes(original) = &value else { unreachable!() };
+        assert_eq!(buffers[0].as_ptr(), original.as_ptr());
+        let (error, buffers) = NativeFrame::error(2, 23, "TEST", "failure").into_parts();
+        assert!(buffers.is_empty());
+        assert_eq!(error[0], 2);
+        assert_eq!(&error[1..9], &23i64.to_le_bytes());
+        assert_eq!(&error[9..], native_result_error_vec("TEST", "failure"));
+        let event = CoreEvent {
+            requestId: None,
+            target: "test".into(),
+            propertyName: "bytes".into(),
+            kind: CoreEventKind::Changed,
+            value,
+        };
+        let (frame, buffers) = NativeFrame::watch(31, "watch", event.clone()).into_parts();
+        assert_eq!(frame[0], 1);
+        assert_eq!(&frame[1..9], &31i64.to_le_bytes());
+        let decoded: (String, (Option<String>, String, String, String, operit_link::CoreValue)) =
+            operit_link::codec::withLinkBuffers(buffers.into(), || operit_link::decodeLink(&frame[9..]).unwrap());
+        assert_eq!(decoded.0, "watch");
+        assert_eq!(decoded.1.4, event.value);
+        assert_eq!(NativeFrame::empty(3, 31).into_parts().0.len(), 9);
+    }
 }
 
 /// Converts one CoreProxy event into its compact native payload tuple.
@@ -164,5 +283,163 @@ fn native_event_kind_name(kind: CoreEventKind) -> &'static str {
         CoreEventKind::Changed => "Changed",
         CoreEventKind::Delta => "Delta",
         CoreEventKind::Completed => "Completed",
+    }
+}
+
+#[cfg(test)]
+mod compact_protocol_tests {
+    use super::*;
+
+    /// Verifies the compact request tuple decodes without a Link envelope map.
+    #[test]
+    fn decodes_compact_request_tuple() {
+        let bytes = operit_link::encodeLink((
+            "request-1",
+            "6",
+            "getCards",
+            operit_link::CoreValue::Bool(true),
+        ))
+        .expect("compact request must encode");
+
+        let request = decode_native_call_request(&bytes).expect("compact request must decode");
+
+        assert_eq!(request.requestId.0, "request-1");
+        assert_eq!(request.target, "6");
+        assert_eq!(request.methodName, "getCards");
+        assert_eq!(request.args, operit_link::CoreValue::Bool(true));
+    }
+
+    /// Verifies every local stream request decodes from a compact tuple.
+    #[test]
+    fn decodes_compact_push_and_watch_tuples() {
+        let push_open = operit_link::encodeLink((
+            "push-1",
+            "7",
+            "interact",
+            operit_link::CoreValue::Null,
+        ))
+        .expect("compact push open must encode");
+        let push_request =
+            decode_native_push_open_request(&push_open).expect("compact push open must decode");
+        assert_eq!(push_request.requestId.0, "push-1");
+        assert_eq!(push_request.target, "7");
+        assert_eq!(push_request.methodName, "interact");
+
+        let push_item = operit_link::encodeLink((
+            "push-1",
+            2u64,
+            operit_link::CoreValue::String("click".to_string()),
+        ))
+        .expect("compact push item must encode");
+        let item = decode_native_push_item(&push_item).expect("compact push item must decode");
+        assert_eq!(item.pushId, "push-1");
+        assert_eq!(item.sequence, 2);
+        assert_eq!(
+            item.args,
+            operit_link::CoreValue::String("click".to_string())
+        );
+
+        let snapshot =
+            operit_link::encodeLink(("watch-1", "8", "cards", operit_link::CoreValue::Null))
+                .expect("compact watch snapshot must encode");
+        let snapshot_request = decode_native_watch_snapshot_request(&snapshot)
+            .expect("compact watch snapshot must decode");
+        assert_eq!(snapshot_request.requestId.0, "watch-1");
+        assert_eq!(snapshot_request.propertyName, "cards");
+
+        let stream = operit_link::encodeLink((
+            "subscription-1",
+            "watch-1",
+            "8",
+            "cards",
+            operit_link::CoreValue::Null,
+        ))
+        .expect("compact watch stream must encode");
+        let (subscription_id, stream_request) =
+            decode_native_watch_stream_request(&stream).expect("compact watch stream must decode");
+        assert_eq!(subscription_id, "subscription-1");
+        assert_eq!(stream_request.requestId.0, "watch-1");
+        assert_eq!(stream_request.propertyName, "cards");
+    }
+
+    /// Verifies the compact success response retains its status and value fields.
+    #[test]
+    fn encodes_compact_success_tuple() {
+        let bytes = native_result_vec(Ok(operit_link::CoreValue::String("ready".to_string())));
+
+        let (status, value): (u8, operit_link::CoreValue) =
+            operit_link::decodeLink(&bytes).expect("compact success must decode");
+
+        assert_eq!(status, 0);
+        assert_eq!(value, operit_link::CoreValue::String("ready".to_string()));
+    }
+
+    /// Verifies the compact error response retains every error field without a map envelope.
+    #[test]
+    fn encodes_compact_error_tuple() {
+        let bytes = native_result_vec(Err::<(), _>(CoreLinkError {
+            code: "CARD_NOT_FOUND".to_string(),
+            message: "Card does not exist".to_string(),
+            details: Some(operit_link::CoreValue::String("card-1".to_string())),
+            location: Some(operit_link::protocol::CoreLinkErrorLocation {
+                file: "CharacterCardManager.rs".to_string(),
+                line: 28,
+                column: 7,
+            }),
+            backtrace: Some("native backtrace".to_string()),
+        }));
+
+        let (status, code, message, details, location, backtrace): (
+            u8,
+            String,
+            String,
+            Option<operit_link::CoreValue>,
+            Option<(String, u32, u32)>,
+            Option<String>,
+        ) = operit_link::decodeLink(&bytes).expect("compact error must decode");
+
+        assert_eq!(status, 1);
+        assert_eq!(code, "CARD_NOT_FOUND");
+        assert_eq!(message, "Card does not exist");
+        assert_eq!(
+            details,
+            Some(operit_link::CoreValue::String("card-1".to_string()))
+        );
+        assert_eq!(
+            location,
+            Some(("CharacterCardManager.rs".to_string(), 28, 7))
+        );
+        assert_eq!(backtrace.as_deref(), Some("native backtrace"));
+    }
+
+    /// Verifies watch snapshots and channel events keep fixed tuple field order.
+    #[test]
+    fn encodes_compact_watch_tuples() {
+        let event = CoreEvent {
+            requestId: Some(operit_link::CoreRequestId::new("watch-1")),
+            target: "core/test8".into(),
+            propertyName: "cards".to_string(),
+            kind: CoreEventKind::Snapshot,
+            value: operit_link::CoreValue::String("card-1".to_string()),
+        };
+        let snapshot = native_result_vec(Ok(native_watch_event_payload(event.clone())));
+        let (status, payload): (
+            u8,
+            (Option<String>, String, String, String, operit_link::CoreValue),
+        ) = operit_link::decodeLink(&snapshot).expect("compact watch snapshot must decode");
+        assert_eq!(status, 0);
+        assert_eq!(payload.0.as_deref(), Some("watch-1"));
+        assert_eq!(payload.1, "core/test8");
+        assert_eq!(payload.2, "cards");
+        assert_eq!(payload.3, "Snapshot");
+
+        let frame = native_watch_event_vec("subscription-1", event);
+        let (subscription_id, frame_payload): (
+            String,
+            (Option<String>, String, String, String, operit_link::CoreValue),
+        ) = operit_link::decodeLink(&frame).expect("compact watch frame must decode");
+        assert_eq!(subscription_id, "subscription-1");
+        assert_eq!(frame_payload.0.as_deref(), Some("watch-1"));
+        assert_eq!(frame_payload.3, "Snapshot");
     }
 }

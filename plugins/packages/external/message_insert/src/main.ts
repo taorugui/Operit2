@@ -13,24 +13,7 @@ RuntimeContext.register({
   saveSettings,
 });
 
-async function appendExtraInfoWithStatus(
-  processedInput: string,
-  chatId?: string,
-  activePrompt?: ToolPkg.ActivePromptSnapshot
-) {
-  return appendExtraInfoToMessage(
-    processedInput,
-    chatId || undefined,
-    activePrompt
-  );
-}
-
-function resolveHookActivePrompt(
-  input: ToolPkg.PromptInputHookEvent | ToolPkg.PromptFinalizeHookEvent
-): ToolPkg.ActivePromptSnapshot | undefined {
-  return input.eventPayload.metadata?.activePrompt;
-}
-
+/** Registers the settings screen and prompt injection hooks. */
 export function registerToolPkg(): boolean {
   ToolPkg.registerToolboxUiModule({
     id: "message_insert_settings",
@@ -61,6 +44,7 @@ export function registerToolPkg(): boolean {
   return true;
 }
 
+/** Injects persisted attachments before input processing when enabled. */
 export async function onPromptInput(
   input: ToolPkg.PromptInputHookEvent
 ) {
@@ -81,15 +65,10 @@ export async function onPromptInput(
     return null;
   }
 
-  const chatId = String(input.eventPayload.chatId ?? getChatId() ?? "").trim();
-  const activePrompt = resolveHookActivePrompt(input);
-  return appendExtraInfoWithStatus(
-    processedInput,
-    chatId || undefined,
-    activePrompt
-  );
+  return appendExtraInfoToMessage(processedInput);
 }
 
+/** Injects transient attachments into the final model request when enabled. */
 export async function onPromptFinalize(
   input: ToolPkg.PromptFinalizeHookEvent
 ) {
@@ -110,15 +89,10 @@ export async function onPromptFinalize(
     return null;
   }
 
-  const chatId = String(input.eventPayload.chatId ?? getChatId() ?? "").trim();
-  const activePrompt = resolveHookActivePrompt(input);
-  return appendExtraInfoWithStatus(
-    processedInput,
-    chatId || undefined,
-    activePrompt
-  );
+  return appendExtraInfoToMessage(processedInput);
 }
 
+/** Reads or toggles the extra information injection menu state. */
 export async function onInputMenuToggle(
   input: ToolPkg.InputMenuToggleHookEvent
 ): Promise<ToolPkg.InputMenuToggleDefinitionResult[]> {

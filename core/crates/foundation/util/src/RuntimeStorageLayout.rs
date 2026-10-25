@@ -111,7 +111,6 @@ pub const DATA_MEMORY_SHARED_DIR_PATH: &str = DATA_MEMORY_SHARED_USER_MARKDOWN.p
 pub const RUNTIME_USER_ASSETS: RuntimeStoragePathDefinition =
     RuntimeStoragePathDefinition::tree("runtime/data/user_assets", RuntimeStorageOwnership::Space);
 pub const RUNTIME_USER_ASSETS_DIR_PATH: &str = RUNTIME_USER_ASSETS.path;
-pub const RUNTIME_CHARACTER_AVATARS_DIR_PATH: &str = "runtime/data/user_assets/character_avatars";
 pub const RUNTIME_THEME_ASSETS_DIR_PATH: &str = "runtime/data/user_assets/theme";
 pub const RUNTIME_SPACE_MEMBERS: RuntimeStoragePathDefinition =
     RuntimeStoragePathDefinition::tree("runtime/space/members", RuntimeStorageOwnership::Space);
@@ -212,6 +211,17 @@ pub const RUNTIME_SHARE_IMAGE_EXPORTS: RuntimeStoragePathDefinition =
         RuntimeStorageOwnership::Ephemeral,
     );
 pub const RUNTIME_SHARE_IMAGE_EXPORTS_DIR_PATH: &str = RUNTIME_SHARE_IMAGE_EXPORTS.path;
+
+/// Owns persistent shared plugin data independently of extension installation scope.
+pub const PLUGIN_DATA_SPACE: RuntimeStoragePathDefinition = RuntimeStoragePathDefinition::tree(
+    "runtime/plugin_data/space", RuntimeStorageOwnership::Space,
+);
+pub const PLUGIN_DATA_SPACE_DIR_PATH: &str = PLUGIN_DATA_SPACE.path;
+/// Owns persistent device-local plugin data independently of extension installation scope.
+pub const PLUGIN_DATA_DEVICE: RuntimeStoragePathDefinition = RuntimeStoragePathDefinition::tree(
+    "runtime/plugin_data/device", RuntimeStorageOwnership::CoreNode,
+);
+pub const PLUGIN_DATA_DEVICE_DIR_PATH: &str = PLUGIN_DATA_DEVICE.path;
 
 /// Owns portable extension installations and configurations shared with the device space.
 pub const EXTENSIONS_SPACE: RuntimeStoragePathDefinition =
@@ -322,7 +332,8 @@ pub const TOOLPKG_LOG_PATH: &str = "runtime/logs/toolpkg.log";
 pub const USER_PREFERENCES_PATH: &str =
     "runtime/config/preferences/user_preferences.preferences.json";
 pub const API_PREFERENCES_PATH: &str = "runtime/config/preferences/api_settings.json";
-pub const ENV_PREFERENCES_PATH: &str =
+/// Identifies the retired node-global environment file used only by the one-time package import.
+pub const LEGACY_ENV_PREFERENCES_PATH: &str =
     "runtime/config/preferences/env_preferences.preferences.json";
 pub const GITHUB_AUTH_PREFERENCES_PATH: &str =
     "runtime/config/preferences/github_auth_preferences.json";
@@ -402,6 +413,9 @@ pub const RUNTIME_STORAGE_PATH_DEFINITIONS: &[RuntimeStoragePathDefinition] = &[
     RUNTIME_LINK_ACCESS_HOST_CONFIG,
     CLIENT_RUNTIME_BOOTSTRAP,
     RUNTIME_APPLICATION_ZOOM,
+    // Model weights, native runtimes and installation inventories belong to this node.
+    RuntimeStoragePathDefinition::tree(RUNTIME_LOCAL_MODELS_DIR_PATH, RuntimeStorageOwnership::CoreNode),
+    RuntimeStoragePathDefinition::exact(RUNTIME_LOCAL_MODEL_REGISTRY_PATH, RuntimeStorageOwnership::CoreNode),
     RUNTIME_CLIENT_LOG,
     RUNTIME_SHARE_IMAGE_EXPORTS,
     // Retain ownership for queued operations and legacy data during the non-destructive upgrade.
@@ -411,6 +425,8 @@ pub const RUNTIME_STORAGE_PATH_DEFINITIONS: &[RuntimeStoragePathDefinition] = &[
     RuntimeStoragePathDefinition::tree("runtime/extensions/plugins/data", RuntimeStorageOwnership::Space),
     EXTENSIONS_SPACE,
     EXTENSIONS_DEVICE,
+    PLUGIN_DATA_SPACE,
+    PLUGIN_DATA_DEVICE,
     EXTENSIONS_SKILLS,
     EXTENSIONS_PACKAGES,
     EXTENSIONS_PLUGIN_CONFIGS,
@@ -476,6 +492,20 @@ mod tests {
     use super::*;
 
     /// Verifies exact, tree, and relative-file definitions resolve from path metadata.
+    #[test]
+    fn local_model_weights_and_install_inventory_are_node_owned() {
+        for path in [
+            "runtime/models/local/chat/llama_cpp/qwen/model.gguf",
+            "runtime/models/local/chat/mnn/qwen/llm.mnn.weight",
+            "runtime/models/local/engines/mnn/3.6.1/engine.json",
+            "runtime/models/local/manifests/qwen.json",
+            "runtime/models/local/download/weights.part",
+            RUNTIME_LOCAL_MODEL_REGISTRY_PATH,
+        ] {
+            assert_eq!(runtimeStorageOwnership(path).unwrap(), RuntimeStorageOwnership::CoreNode, "{path}");
+        }
+    }
+
     #[test]
     fn resolves_registered_runtime_storage_ownership() {
         assert_eq!(

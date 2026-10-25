@@ -8,6 +8,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';
 
+import '../../../core/bridge/OperitRuntimeBridge.dart';
+import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+
 import '../components/DrawerConversationState.dart';
 import '../components/DrawerContent.dart';
 import '../components/NavigationDrawerAppearance.dart';
@@ -20,6 +23,7 @@ class PhoneLayout extends StatefulWidget {
   /// Creates the retained phone content and its animated navigation drawer.
   const PhoneLayout({
     super.key,
+    this.bridge = const ProxyCoreRuntimeBridge(),
     required this.content,
     required this.navigationEntries,
     required this.pluginSidebarEntries,
@@ -34,6 +38,7 @@ class PhoneLayout extends StatefulWidget {
     required this.onConversationActivated,
   });
 
+  final OperitRuntimeBridge bridge;
   final Widget content;
   final List<NavigationEntrySpec> navigationEntries;
   final List<NavigationEntrySpec> pluginSidebarEntries;
@@ -189,6 +194,7 @@ class _PhoneLayoutState extends State<PhoneLayout>
             valueListenable: widget.drawerConversationState,
             builder: (context, drawerState, _) {
               return DrawerContent(
+                bridge: widget.bridge,
                 key: const ValueKey<String>('phoneDrawerContent'),
                 navigationEntries: widget.navigationEntries,
                 pluginEntries: widget.pluginSidebarEntries,
@@ -196,9 +202,6 @@ class _PhoneLayoutState extends State<PhoneLayout>
                 appearance: appearance,
                 histories: drawerState.histories,
                 activeStreamingChatIds: drawerState.activeStreamingChatIds,
-                characterGroupNamesById: drawerState.characterGroupNamesById,
-                characterCardAvatarUrisByName:
-                    drawerState.characterCardAvatarUrisByName,
                 currentChatId: drawerState.currentChatId,
                 errorMessage: drawerState.errorMessage,
                 loading: drawerState.loading,
@@ -297,6 +300,8 @@ class _PhoneLayoutState extends State<PhoneLayout>
                             if (contentShadowVisible && contentShadowBlur > 0)
                               BoxShadow(
                                 blurRadius: contentShadowBlur,
+                                // Keep the image visible through the page.
+                                blurStyle: BlurStyle.outer,
                                 color: Colors.black.withValues(alpha: 0.16),
                               ),
                           ],
@@ -332,30 +337,32 @@ class _PhoneLayoutState extends State<PhoneLayout>
                 child: Transform.translate(
                   // A fixed Stack slot keeps drag frames in the paint phase.
                   offset: Offset(drawerOffset, 0),
-                  child: Opacity(
-                    opacity: clampedDrawerContentAlpha,
-                    child: Transform.scale(
-                      alignment: Alignment.centerLeft,
-                      scale: drawerScale,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          boxShadow: <BoxShadow>[
-                            if (drawerProgress > 0.001)
-                              BoxShadow(
-                                blurRadius: sidebarShadowBlur,
-                                color: Colors.black.withValues(alpha: 0.12),
-                              ),
-                          ],
-                        ),
-                        child: OperitGlassSurface(
-                          color: appearance.containerColor,
-                          layer: OperitGlassSurfaceLayer.panel,
-                          transparentAlpha: 0.035,
-                          enableBackdropFilter: false,
-                          borderRadius: const BorderRadiusDirectional.only(
-                            topEnd: Radius.circular(16),
-                            bottomEnd: Radius.circular(16),
-                          ).resolve(Directionality.of(context)),
+                  child: Transform.scale(
+                    alignment: Alignment.centerLeft,
+                    scale: drawerScale,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        boxShadow: <BoxShadow>[
+                          if (drawerProgress > 0.001)
+                            BoxShadow(
+                              blurRadius: sidebarShadowBlur,
+                              // Keep the translucent drawer interior clear.
+                              blurStyle: BlurStyle.outer,
+                              color: Colors.black.withValues(alpha: 0.12),
+                            ),
+                        ],
+                      ),
+                      child: OperitGlassSurface(
+                        color: appearance.containerColor,
+                        layer: OperitGlassSurfaceLayer.panel,
+                        transparentAlpha: 0.035,
+                        borderRadius: const BorderRadiusDirectional.only(
+                          topEnd: Radius.circular(16),
+                          bottomEnd: Radius.circular(16),
+                        ).resolve(Directionality.of(context)),
+                        // Fade controls without isolating the backdrop.
+                        child: Opacity(
+                          opacity: clampedDrawerContentAlpha,
                           child: animatedChild.drawerContent,
                         ),
                       ),

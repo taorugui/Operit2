@@ -57,6 +57,12 @@ impl TestRuntimeHost {
 }
 
 impl RuntimeStorageHost for TestRuntimeHost {
+    /// Flushes the existing test file through its backing filesystem.
+    fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
+        std::fs::OpenOptions::new().write(true).open(self.resolve(path)?)?.sync_all()?;
+        Ok(())
+    }
+
     fn runtimeRootDir(&self) -> Option<PathBuf> {
         Some(self.root.clone())
     }
@@ -82,6 +88,12 @@ impl RuntimeStorageHost for TestRuntimeHost {
             .ok_or_else(|| HostError::new("runtime storage byte range overflows usize"))?
             .min(content.len());
         Ok(content[start..end].to_vec())
+    }
+
+    /// Uses the production atomic writer for filesystem-backed persistence tests.
+    fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        operit_host_native_storage::NativeRuntimeStorageHost::new(self.root.join("runtime"), self.root.join("workspaces"))
+            .writeBytesAtomically(path, content)
     }
 
     fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
@@ -234,6 +246,13 @@ impl RuntimeSqliteTransaction for TestRuntimeSqliteTransaction<'_> {
             .commit()
             .map_err(|error| HostError::new(error.to_string()))
     }
+
+    /// Aborts the host transaction explicitly instead of relying on destructor cleanup.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        self.transaction
+            .rollback()
+            .map_err(|error| HostError::new(error.to_string()))
+    }
 }
 
 trait TestRusqliteConnection {
@@ -360,6 +379,7 @@ fn message(chatId: &str, timestamp: i64, content: &str) -> MessageEntity {
         timestamp,
         orderIndex: 0,
         roleName: String::new(),
+        pluginExtensions: BTreeMap::new(),
         selectedVariantIndex: 0,
         provider: "test-provider".to_string(),
         modelName: "test-model".to_string(),
@@ -465,7 +485,7 @@ fn upsertOperation(sequence: i64, content: &str) -> SyncOperation {
         semantics: SyncOperationSemantics::EntityState,
         payload: serde_json::to_value(payload).unwrap(),
         createdAt: sequence,
-        schemaVersion: 6,
+        schemaVersion: CHAT_SYNC_OPERATION_SCHEMA_VERSION,
     }
 }
 
@@ -625,7 +645,7 @@ fn chat_dao_update_chats_preserves_child_messages() {
         .unwrap()
         .expect("chat must exist");
     chat.displayOrder = 42;
-    chat.group = Some("updated-group".to_string());
+    chat.workspaceId = Some("updated-workspace".to_string());
     chat.updatedAt = 9_100;
     database.chatDao().updateChats(vec![chat]).unwrap();
 
@@ -635,7 +655,7 @@ fn chat_dao_update_chats_preserves_child_messages() {
         .unwrap()
         .expect("chat must remain");
     assert_eq!(updated.displayOrder, 42);
-    assert_eq!(updated.group.as_deref(), Some("updated-group"));
+    assert_eq!(updated.workspaceId.as_deref(), Some("updated-workspace"));
     let messages = database.messageDao().getMessagesForChat(chatId).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(
@@ -817,6 +837,9 @@ fn migrates_version_22_messages_to_final_structured_parts() {
                 "#,
             )
             .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/historical-migration-support.sql"))
+            .unwrap();
         store.setUserVersion(22).unwrap();
     }
 
@@ -963,6 +986,12 @@ fn migrates_version_23_message_revisions_to_canonical_visible_parts() {
                 "#,
             )
             .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/historical-migration-support.sql"))
+            .unwrap();
+        store
+            .executeBatch(include_str!("fixtures/version23-sync-variant-rows.sql"))
+            .unwrap();
         store.setUserVersion(23).unwrap();
     }
 
@@ -997,19 +1026,17 @@ fn migrates_version_25_execution_generation_columns() {
     {
         let store = SqliteStore::open(paths.sqlite_database_path()).unwrap();
         store
+            .executeBatch(include_str!("../../db/fixtures/version27-chat-records.sql"))
+            .unwrap();
+        store
             .executeBatch(
                 r#"
-                CREATE TABLE messages (
-                    messageId INTEGER PRIMARY KEY NOT NULL,
-                    completedRouteGeneration INTEGER NOT NULL
-                );
-                CREATE TABLE sync_sql_message_rows (
-                    opId TEXT PRIMARY KEY NOT NULL,
-                    completedRouteGeneration INTEGER NOT NULL
-                );
-                INSERT INTO messages (messageId, completedRouteGeneration) VALUES (1, 7);
-                INSERT INTO sync_sql_message_rows (opId, completedRouteGeneration)
-                VALUES ('operation-25', 9);
+                ALTER TABLE messages RENAME COLUMN completedExecutionGeneration TO completedRouteGeneration;
+                ALTER TABLE sync_sql_message_rows RENAME COLUMN completedExecutionGeneration TO completedRouteGeneration;
+                UPDATE messages SET completedRouteGeneration = 7 WHERE messageId = 1;
+                UPDATE sync_sql_message_rows SET completedRouteGeneration = 9 WHERE opId = 'v27:1';
+                DROP TABLE token_usage_records;
+                DROP TABLE token_stats_models;
                 "#,
             )
             .unwrap();
@@ -1033,7 +1060,7 @@ fn migrates_version_25_execution_generation_columns() {
         database
             .store()
             .queryScalar::<i64>(
-                "SELECT completedExecutionGeneration FROM sync_sql_message_rows WHERE opId = 'operation-25'",
+                "SELECT completedExecutionGeneration FROM sync_sql_message_rows WHERE opId = 'v27:1'",
                 sqliteParams![],
             )
             .unwrap(),
@@ -1061,7 +1088,10 @@ fn record_message_snapshots_are_merged_into_final_stream_state() {
         .unwrap();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].sequence, 100);
-    assert_eq!(operations[0].schemaVersion, 5);
+    assert_eq!(
+        operations[0].schemaVersion,
+        CHAT_SYNC_OPERATION_SCHEMA_VERSION
+    );
     let payload = exportedPayload(&operations[0]);
     assert_eq!(payload.messageRows.len(), 1);
     assert_eq!(payload.partRows[0].content, "token-100");
@@ -1392,7 +1422,82 @@ fn stress_ultra_many_messages_roundtrip_with_stream_compaction() {
     AppDatabase::closeDatabase();
 }
 
-// Reuse this suite's host installer and mutex for memory search sync regressions.
-mod MemoryRepositoryReadTests;
+/// Applies an earlier independent SQL entity after a later sequence and exports the exact missing gap.
+#[test]
+fn sparse_sql_receipts_do_not_hide_earlier_independent_entities() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (_paths, database, syncStore) = openTestStore("sparse-sql-receipts");
+    let earlier = upsertOperation(1, "earlier");
+    let mut later = upsertOperation(2, "later");
+    let mut payload: ChatSyncPayload = serde_json::from_value(later.payload.clone()).unwrap();
+    payload.messageRows[0].timestamp = 2001;
+    payload.partRows[0].messageTimestamp = 2001;
+    later.entityId = "chat-remote:2001".into();
+    later.payload = serde_json::to_value(payload).unwrap();
+    syncStore.applyOperation(&later).unwrap();
+    syncStore.applyOperation(&earlier).unwrap();
+    assert!(
+        database
+            .messageDao()
+            .getMessageByTimestamp("chat-remote", 2000)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        database
+            .messageDao()
+            .getMessageByTimestamp("chat-remote", 2001)
+            .unwrap()
+            .is_some()
+    );
+    let mut receipt = SyncReceipt::default();
+    receipt.observe("remote-sql", 2);
+    let exported = syncStore
+        .operationsSince(&receipt, &[CHAT_SYNC_DOMAIN.into()], 1)
+        .unwrap();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].opId, earlier.opId);
+    assert_eq!(
+        syncStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[1, 2]]
+    );
+    AppDatabase::closeDatabase();
+}
 
-mod ObjectBoxSyncTests;
+/// Keeps accepted sequence membership after SQL deliberately compacts an older entity snapshot.
+#[test]
+fn native_sql_compaction_does_not_erase_durable_receipts() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (_paths, database, syncStore) = openTestStore("compacted-sql-receipts");
+    let earlier = upsertOperation(1, "earlier");
+    let later = upsertOperation(2, "later");
+    let operations = vec![earlier, later];
+    syncStore
+        .syncOperationStore
+        .receiveOperations(&operations)
+        .unwrap();
+    for operation in &operations {
+        syncStore.applyOperation(operation).unwrap();
+        syncStore
+            .syncOperationStore
+            .completeOperations(std::slice::from_ref(operation))
+            .unwrap();
+    }
+    assert_eq!(sqlOperationCount(&database), 1);
+    assert_eq!(
+        syncStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[2, 2]]
+    );
+    assert_eq!(
+        syncStore.syncOperationStore.receipt().unwrap().ranges["remote-sql"],
+        vec![[1, 2]]
+    );
+    assert!(
+        syncStore
+            .syncOperationStore
+            .pendingOperations()
+            .unwrap()
+            .is_empty()
+    );
+    AppDatabase::closeDatabase();
+}

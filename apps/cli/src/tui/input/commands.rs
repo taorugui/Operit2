@@ -6,7 +6,7 @@ pub(super) struct TuiCommandSpec {
     pub(super) usage: &'static str,
     pub(super) description_key: TuiTextKey,
     /// Keyword-value options completing in any order after the command
-    /// (e.g. `new character <name> group <name>`). Empty for path-style
+    /// (e.g. `new source <chat-id> input <json-object>`). Empty for path-style
     /// commands; only the entry whose `name` equals the command word
     /// declares them.
     pub(super) options: &'static [&'static str],
@@ -53,7 +53,7 @@ impl TuiCommandSuggestion {
     }
 }
 
-const COMMAND_SPECS: [TuiCommandSpec; 74] = [
+const COMMAND_SPECS: &[TuiCommandSpec] = &[
     TuiCommandSpec {
         name: "help",
         usage: "/help",
@@ -62,26 +62,20 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
     },
     TuiCommandSpec {
         name: "new",
-        usage: "/new [character <name>] [group-card <id>] [group <name>]",
+        usage: "/new [source <chat-id>] [input <json-object>]",
         description_key: TuiTextKey::CommandNewDescription,
-        options: &["character", "group-card", "group"],
+        options: &["source", "input"],
     },
     TuiCommandSpec {
-        name: "new character",
-        usage: "/new character <name>",
-        description_key: TuiTextKey::CommandNewCharacterDescription,
+        name: "new source",
+        usage: "/new source <chat-id>",
+        description_key: TuiTextKey::CommandNewDescription,
         options: &[],
     },
     TuiCommandSpec {
-        name: "new group-card",
-        usage: "/new group-card <id>",
-        description_key: TuiTextKey::CommandNewGroupCardDescription,
-        options: &[],
-    },
-    TuiCommandSpec {
-        name: "new group",
-        usage: "/new group <name>",
-        description_key: TuiTextKey::CommandNewGroupDescription,
+        name: "new input",
+        usage: "/new input <json-object>",
+        description_key: TuiTextKey::CommandNewDescription,
         options: &[],
     },
     TuiCommandSpec {
@@ -141,6 +135,12 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         options: &[],
     },
     TuiCommandSpec {
+        name: "network doctor",
+        usage: "/network doctor",
+        description_key: TuiTextKey::CommandNetworkDoctorDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
         name: "network devices",
         usage: "/network devices",
         description_key: TuiTextKey::CommandNetworkDevicesDescription,
@@ -165,6 +165,18 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         options: &[],
     },
     TuiCommandSpec {
+        name: "network identity update",
+        usage: "/network identity update <identity> <name> [capability...]",
+        description_key: TuiTextKey::CommandNetworkIdentityUpdateDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
+        name: "network identity delete",
+        usage: "/network identity delete <identity>",
+        description_key: TuiTextKey::CommandNetworkIdentityDeleteDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
         name: "network identity set",
         usage: "/network identity set <device> <identity>",
         description_key: TuiTextKey::CommandNetworkIdentitySetDescription,
@@ -174,6 +186,12 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         name: "network identity clear",
         usage: "/network identity clear <device>",
         description_key: TuiTextKey::CommandNetworkIdentityClearDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
+        name: "network name",
+        usage: "/network name <name>",
+        description_key: TuiTextKey::CommandNetworkNameDescription,
         options: &[],
     },
     TuiCommandSpec {
@@ -204,12 +222,6 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         name: "network policy set",
         usage: "/network policy set <key> <value>",
         description_key: TuiTextKey::CommandNetworkPolicySetDescription,
-        options: &[],
-    },
-    TuiCommandSpec {
-        name: "network token",
-        usage: "/network token",
-        description_key: TuiTextKey::CommandNetworkTokenDescription,
         options: &[],
     },
     TuiCommandSpec {
@@ -244,7 +256,7 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
     },
     TuiCommandSpec {
         name: "network pair",
-        usage: "/network pair <address> <http|ws|tcp|serial|bluetooth> [--token <token>]",
+        usage: "/network pair <address> <http|ws|tcp|serial|bluetooth>",
         description_key: TuiTextKey::CommandNetworkPairDescription,
         options: &[],
     },
@@ -447,12 +459,6 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         options: &[],
     },
     TuiCommandSpec {
-        name: "skill toggle",
-        usage: "/skill toggle <name>",
-        description_key: TuiTextKey::CommandSkillToggleDescription,
-        options: &[],
-    },
-    TuiCommandSpec {
         name: "package",
         usage: "/package",
         description_key: TuiTextKey::CommandPackageDescription,
@@ -486,6 +492,18 @@ const COMMAND_SPECS: [TuiCommandSpec; 74] = [
         name: "mcp toggle",
         usage: "/mcp toggle <name>",
         description_key: TuiTextKey::CommandMcpToggleDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
+        name: "status",
+        usage: "/status",
+        description_key: TuiTextKey::CommandStatusDescription,
+        options: &[],
+    },
+    TuiCommandSpec {
+        name: "log",
+        usage: "/log",
+        description_key: TuiTextKey::CommandLogDescription,
         options: &[],
     },
     TuiCommandSpec {
@@ -566,7 +584,7 @@ pub(super) fn expand_plugin_command(
 }
 
 pub(super) fn command_specs() -> &'static [TuiCommandSpec] {
-    &COMMAND_SPECS
+    COMMAND_SPECS
 }
 
 /// Returns the keyword-value options declared for a command word, if any.
@@ -672,7 +690,7 @@ pub(super) fn complete_command_input(
             .trim()
             .to_ascii_lowercase()
     );
-    // Option-style entries such as `new group-card` are appended after the
+    // Option-style entries such as `new source` are appended after the
     // keywords and values already typed; everything else replaces the buffer.
     let completed =
         if typed == lowercased || lowercased.starts_with(&typed) {
@@ -789,28 +807,15 @@ mod tests {
 
     #[test]
     fn new_options_complete_after_trailing_space() {
-        assert_eq!(
-            builtin_names("/new g"),
-            vec!["new group-card".to_string(), "new group".to_string()]
-        );
-        assert_eq!(
-            builtin_names("/new character Alice "),
-            vec!["new group-card".to_string(), "new group".to_string()]
-        );
-        assert_eq!(
-            builtin_names("/new character Alice group-card 5 "),
-            vec!["new group".to_string()]
-        );
-        assert_eq!(
-            builtin_names("/new character Alice group-card 5 group Heroes "),
-            Vec::<String>::new()
-        );
+        assert_eq!(builtin_names("/new s"), vec!["new source".to_string()]);
+        assert_eq!(builtin_names("/new source parent "), vec!["new input".to_string()]);
+        assert_eq!(builtin_names("/new source parent input {} "), Vec::<String>::new());
     }
 
     #[test]
     fn new_value_positions_stay_clear_of_suggestions() {
-        assert_eq!(builtin_names("/new character "), Vec::<String>::new());
-        assert_eq!(builtin_names("/new cha"), vec!["new character".to_string()]);
+        assert_eq!(builtin_names("/new source "), Vec::<String>::new());
+        assert_eq!(builtin_names("/new inp"), vec!["new input".to_string()]);
     }
 
     #[test]
@@ -823,10 +828,6 @@ mod tests {
 
     #[test]
     fn network_linking_subcommands_are_suggested() {
-        assert_eq!(
-            builtin_names("/network token"),
-            vec!["network token".to_string()]
-        );
         assert_eq!(
             builtin_names("/network prompts"),
             vec!["network prompts".to_string()]
@@ -843,6 +844,26 @@ mod tests {
             builtin_names("/network reject"),
             vec!["network reject".to_string()]
         );
+    }
+
+    #[test]
+    fn headless_panel_commands_are_suggested() {
+        assert_eq!(builtin_names("/sta"), vec!["status".to_string()]);
+        assert_eq!(builtin_names("/lo"), vec!["log".to_string()]);
+        assert_eq!(
+            builtin_names("/network na"),
+            vec!["network name".to_string()]
+        );
+        assert_eq!(
+            builtin_names("/network identity u"),
+            vec!["network identity update".to_string()]
+        );
+        assert_eq!(
+            builtin_names("/network identity del"),
+            vec!["network identity delete".to_string()]
+        );
+        assert!(!builtin_names("/skill ")
+            .contains(&"skill toggle".to_string()));
     }
 
     #[test]

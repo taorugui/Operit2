@@ -20,6 +20,7 @@ async-trait = "0.1"
 log = "0.4"
 operit-board-esp32 = { path = "../../hosts/boards/esp32" }
 operit-node-edge = { path = "../../core/crates/node/edge" }
+operit-edge-scene = { path = "../../hosts/common/operit-edge-scene" }
 operit-host-api = { path = "../../core/crates/foundation/host-api" }
 operit-link = { path = "../../core/crates/foundation/link" }
 operit-util = { path = "../../core/crates/foundation/util" }
@@ -50,6 +51,7 @@ esp_idf_components = [
   "esp_netif",
   "esp_wifi",
   "esp_http_server",
+  "esp_http_client",
   "espressif__mdns",
   "ui_port",
 ]
@@ -57,6 +59,12 @@ extra_components = [
   { remote_component = { name = "espressif/mdns", version = "1.2.0" } },
   { component_dirs = ["ui_port"] },
 ]
+
+# Remove duplicated code across the shared device runtime without changing the
+# fixed 4 MB board/partition layout or the package-specific Xtensa workarounds.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 # Xtensa LLVM cannot lower the vectorized UUID hex parser at opt-level 3.
 # Keep the workaround scoped to UUID; the firmware remains a release build.
@@ -93,4 +101,7 @@ opt-level = "z"
 [profile.release.package.operit-peer-link]
 opt-level = "z"
 [profile.release.package.operit-host-api]
+opt-level = "z"
+
+[profile.release.package.operit-edge-scene]
 opt-level = "z"

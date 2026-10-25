@@ -156,6 +156,20 @@ pub struct ToolPkgAiProviderRegistration {
     pub calculateInputTokensFunctionSource: Option<String>,
 }
 
+/// Registers a single creation initializer owned by one authenticated ToolPkg container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct ToolPkgChatLifecycleHookRegistration {
+    /// Identifies the actual registered and enabled package, never a plugin-returned owner.
+    pub containerPackageName: String,
+    /// Identifies the single package registration selected for this draft.
+    pub hookId: String,
+    /// Identifies the real exported or durable module-backed main hook function.
+    pub functionName: String,
+    /// Preserves the existing serialized module handler when supplied by SDK capture.
+    pub functionSource: Option<String>,
+}
+
 /// Registration for one host-originated event hook.
 #[derive(Clone, Debug, serde::Serialize)]
 #[allow(non_snake_case)]
@@ -184,7 +198,8 @@ pub struct ToolPkgHookInvocation {
     pub runtimeKind: Option<String>,
     pub envOverrides: BTreeMap<String, String>,
     pub timestampMs: i64,
-    pub timeoutMillis: u64,
+    /// Bounds only an explicitly timed before hook; ordinary hooks await completion.
+    pub timeoutMillis: Option<u64>,
     pub dispatchIntermediateOnMain: bool,
     pub onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
@@ -197,7 +212,9 @@ pub trait ToolPkgHookDispatcher: Send + Sync {
         &self,
         enabledPackageNames: &[String],
         invocation: ToolPkgHookInvocation,
-    ) -> crate::javascript::JsExecutionCompletion<Result<Option<String>, String>>;
+    ) -> crate::javascript::JsExecutionCompletion<
+        crate::execution_result::JsExecutionResult<Option<String>>,
+    >;
 }
 
 /// Decodes a hook output as JSON when the output contains valid JSON.

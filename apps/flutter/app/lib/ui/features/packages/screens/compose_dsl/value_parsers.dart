@@ -79,10 +79,12 @@ EdgeInsets? _commonPaddingFromProps(Map<String, Object?> props) {
   if (props['padding'] != null) {
     return _edgeInsetsFromValue(props['padding']);
   }
-  final start = _number(props['paddingStart']);
-  final top = _number(props['paddingTop']);
-  final end = _number(props['paddingEnd']);
-  final bottom = _number(props['paddingBottom']);
+  final horizontal = _number(props['paddingHorizontal']);
+  final vertical = _number(props['paddingVertical']);
+  final start = _number(props['paddingStart']) ?? horizontal;
+  final top = _number(props['paddingTop']) ?? vertical;
+  final end = _number(props['paddingEnd']) ?? horizontal;
+  final bottom = _number(props['paddingBottom']) ?? vertical;
   if (start != null || top != null || end != null || bottom != null) {
     return EdgeInsets.only(
       left: start ?? 0,
@@ -91,21 +93,15 @@ EdgeInsets? _commonPaddingFromProps(Map<String, Object?> props) {
       bottom: bottom ?? 0,
     );
   }
-  final horizontal = _number(props['paddingHorizontal']);
-  final vertical = _number(props['paddingVertical']);
-  if (horizontal != null || vertical != null) {
-    return EdgeInsets.symmetric(
-      horizontal: horizontal ?? 0,
-      vertical: vertical ?? 0,
-    );
-  }
   return null;
 }
 
-/// Uses spaced-by gap only when the arrangement is the Compose start default.
+/// Preserves fixed gaps in aligned groups; distributed arrangements own their gaps.
 double _flexSpacing(Object? arrangement, Object? spacing) {
   final token = _normalizeToken(_string(arrangement));
-  if (token.isNotEmpty && token != 'start') {
+  if (token == 'spacebetween' ||
+      token == 'spacearound' ||
+      token == 'spaceevenly') {
     return 0;
   }
   return _number(spacing) ?? 0;
@@ -231,6 +227,7 @@ TextStyle? _textStyle(BuildContext context, Map<String, Object?> props) {
   return _scaledTextStyle(style!, _number(props['fontSize'])).copyWith(
     color: _color(context, props['color']),
     fontWeight: _fontWeight(_string(props['fontWeight'])),
+    letterSpacing: _number(props['letterSpacing']),
   );
 }
 
@@ -246,6 +243,36 @@ TextStyle? _textFieldStyle(BuildContext context, Object? raw) {
     fontFamily: _string(raw['fontFamily']).trim().isEmpty
         ? null
         : _string(raw['fontFamily']).trim(),
+  );
+}
+
+/// Resolves optional plugin-owned input decoration without changing theme defaults.
+InputDecoration? _textFieldDecoration(BuildContext context, Object? raw) {
+  if (raw is! Map) return null;
+  final radius = _number(raw['cornerRadius']);
+  final borderColor = _color(context, raw['borderColor']);
+  final focusedColor = _color(context, raw['focusedBorderColor']);
+  final border = radius == null && borderColor == null && focusedColor == null
+      ? null
+      : OutlineInputBorder(
+          borderRadius: BorderRadius.circular(radius ?? 4),
+          borderSide: borderColor == null
+              ? BorderSide.none
+              : BorderSide(color: borderColor),
+        );
+  return InputDecoration(
+    isDense: raw['isDense'] == null ? null : _bool(raw['isDense']),
+    filled: raw['filled'] == null ? null : _bool(raw['filled']),
+    fillColor: _color(context, raw['fillColor']),
+    contentPadding: raw['contentPadding'] == null
+        ? null
+        : _edgeInsetsFromValue(raw['contentPadding']),
+    hintStyle: _textFieldStyle(context, raw['hintStyle']),
+    border: border,
+    enabledBorder: border,
+    focusedBorder: focusedColor == null
+        ? null
+        : border!.copyWith(borderSide: BorderSide(color: focusedColor)),
   );
 }
 
@@ -297,11 +324,11 @@ Alignment _alignment(Object? raw) {
     'center' => Alignment.center,
     'topCenter' || 'centerTop' => Alignment.topCenter,
     'topEnd' || 'endTop' => Alignment.topRight,
-    'centerEnd' || 'endCenter' => Alignment.centerRight,
+    'end' || 'centerEnd' || 'endCenter' => Alignment.centerRight,
     'bottomEnd' || 'endBottom' => Alignment.bottomRight,
     'bottomCenter' || 'centerBottom' => Alignment.bottomCenter,
     'bottomStart' || 'startBottom' => Alignment.bottomLeft,
-    'centerStart' || 'startCenter' => Alignment.centerLeft,
+    'start' || 'centerStart' || 'startCenter' => Alignment.centerLeft,
     _ => Alignment.topLeft,
   };
 }
@@ -424,6 +451,26 @@ Color? _colorToken(ColorScheme scheme, String token) {
     'onTertiaryContainer' => scheme.onTertiaryContainer,
     'surface' => scheme.surface,
     'onSurface' => scheme.onSurface,
+    'surfaceDim' => scheme.surfaceDim,
+    'surfaceBright' => scheme.surfaceBright,
+    'surfaceContainerLowest' => scheme.surfaceContainerLowest,
+    'surfaceContainerLow' => scheme.surfaceContainerLow,
+    'surfaceContainer' => scheme.surfaceContainer,
+    'surfaceContainerHigh' => scheme.surfaceContainerHigh,
+    'surfaceContainerHighest' => scheme.surfaceContainerHighest,
+    'shadow' => scheme.shadow,
+    'primaryFixed' => scheme.primaryFixed,
+    'primaryFixedDim' => scheme.primaryFixedDim,
+    'onPrimaryFixed' => scheme.onPrimaryFixed,
+    'onPrimaryFixedVariant' => scheme.onPrimaryFixedVariant,
+    'secondaryFixed' => scheme.secondaryFixed,
+    'secondaryFixedDim' => scheme.secondaryFixedDim,
+    'onSecondaryFixed' => scheme.onSecondaryFixed,
+    'onSecondaryFixedVariant' => scheme.onSecondaryFixedVariant,
+    'tertiaryFixed' => scheme.tertiaryFixed,
+    'tertiaryFixedDim' => scheme.tertiaryFixedDim,
+    'onTertiaryFixed' => scheme.onTertiaryFixed,
+    'onTertiaryFixedVariant' => scheme.onTertiaryFixedVariant,
     'surfaceVariant' => scheme.surfaceContainerHighest,
     'onSurfaceVariant' => scheme.onSurfaceVariant,
     'background' => scheme.surface,
@@ -535,25 +582,6 @@ List<Map<String, Object?>> _canvasCommands(Object? raw) {
     return const <Map<String, Object?>>[];
   }
   return raw.whereType<Map>().map(_stringMap).toList(growable: false);
-}
-
-/// Resolves node list for the Compose DSL renderer.
-List<_ComposeDslNode> _nodeList(Object? raw) {
-  if (raw is List) {
-    return raw
-        .map(_ComposeDslNode.parse)
-        .whereType<_ComposeDslNode>()
-        .toList(growable: false);
-  }
-  return const <_ComposeDslNode>[];
-}
-
-/// Resolves slot map for the Compose DSL renderer.
-Map<String, List<_ComposeDslNode>> _slotMap(Object? raw) {
-  if (raw is Map) {
-    return raw.map((key, value) => MapEntry(key.toString(), _nodeList(value)));
-  }
-  return const <String, List<_ComposeDslNode>>{};
 }
 
 /// Resolves string for the Compose DSL renderer.

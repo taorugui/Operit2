@@ -4,7 +4,11 @@ import 'package:flutter/material.dart';
 
 import '../../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../common/markdown/StreamMarkdownRenderer.dart';
+import '../../../../common/ChatMessageIdentity.dart';
+import '../../../../common/ChatResponsePresentation.dart';
 import '../../viewmodel/ChatViewModel.dart';
+import '../../../../../core/proxy/generated/CoreProxyModels.g.dart'
+    as core_proxy;
 import 'bubble/BubbleStyleChatMessage.dart';
 import 'bubble/BubbleSurface.dart';
 import 'cursor/CursorStyleChatMessage.dart';
@@ -18,17 +22,56 @@ Widget buildThemedChatMessage({
   required ThemePreferenceSnapshot snapshot,
   required ColorScheme colorScheme,
   required ChatUiMessage message,
-  String? currentCharacterCardAvatarUri,
+  VoidCallback? onIdentityTap,
   MarkdownContentSplitter? splitMarkdownContent,
   Future<void> Function(int timestamp)? onDeleteMessage,
   ValueChanged<ChatUiMessage>? onEditSummary,
   bool enableDialogs = true,
 }) {
+  final presentation = readChatResponsePresentation(message);
+  if (presentation != null) {
+    final structural = message.parts
+        .where((part) => part.kind != core_proxy.MessagePartKind.markdown)
+        .toList(growable: false);
+    final groups = <({String key, List<core_proxy.MessagePart> parts})>[
+      if (structural.isNotEmpty) (key: 'response-structure', parts: structural),
+      for (var index = 0; index < presentation.bubbles.length; index++)
+        (key: 'response-bubble-$index', parts: presentation.bubbles[index]),
+    ];
+    return Column(
+      key: key,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (var index = 0; index < groups.length; index++)
+          Padding(
+            key: ValueKey(groups[index].key),
+            padding: EdgeInsets.only(top: index == 0 ? 0 : 8),
+            child: buildThemedChatMessage(
+              snapshot: snapshot,
+              colorScheme: colorScheme,
+              message: responseBubbleMessage(
+                message,
+                groups[index].parts,
+                includeMetrics: index == groups.length - 1,
+              ),
+              onIdentityTap: onIdentityTap,
+              splitMarkdownContent: splitMarkdownContent,
+              onDeleteMessage: onDeleteMessage,
+              onEditSummary: onEditSummary,
+              enableDialogs: enableDialogs,
+            ),
+          ),
+      ],
+    );
+  }
+  final identityAvatarUri = readChatMessageIdentity(message)?.avatarUri;
   if (snapshot.chatStyle != UserPreferencesManager.CHAT_STYLE_BUBBLE) {
     return CursorStyleChatMessage(
       key: key,
       message: message,
-      currentCharacterCardAvatarUri: currentCharacterCardAvatarUri,
+      identityAvatarUri: identityAvatarUri,
+      onIdentityTap: onIdentityTap,
       splitMarkdownContent: splitMarkdownContent,
       onDeleteMessage: onDeleteMessage,
       onEditSummary: onEditSummary,
@@ -54,7 +97,8 @@ Widget buildThemedChatMessage({
     bubbleUserContentPaddingRight: snapshot.bubbleUserContentPaddingRight,
     bubbleAiContentPaddingLeft: snapshot.bubbleAiContentPaddingLeft,
     bubbleAiContentPaddingRight: snapshot.bubbleAiContentPaddingRight,
-    currentCharacterCardAvatarUri: currentCharacterCardAvatarUri,
+    identityAvatarUri: identityAvatarUri,
+    onIdentityTap: onIdentityTap,
     splitMarkdownContent: splitMarkdownContent,
     onDeleteMessage: onDeleteMessage,
     onEditSummary: onEditSummary,

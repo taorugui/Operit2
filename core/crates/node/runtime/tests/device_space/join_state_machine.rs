@@ -29,6 +29,7 @@ fn record(status: SpaceJoinStatus) -> Record {
             model: "test".into(),
             coreVersion: None,
             updatedAt: 1,
+            pairingIncarnation: None,
         },
         source: PeerSpaceSnapshot {
             space: CoreSpace {
@@ -40,6 +41,7 @@ fn record(status: SpaceJoinStatus) -> Record {
             deviceProfiles: Vec::new(),
             controlOperations: Vec::new(),
             topology: Vec::new(),
+            departures: Vec::new(),
         },
         accepted: None,
         unavailableSince: None,

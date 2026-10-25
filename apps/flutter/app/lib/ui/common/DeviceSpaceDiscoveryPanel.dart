@@ -181,10 +181,23 @@ class _AddDeviceDialog extends StatefulWidget {
     required this.clients,
     required this.onJoined,
     this.autoScan = true,
+    this.title,
+    this.hint,
+    this.onlyNodeId,
   });
   final GeneratedCoreProxyClients clients;
   final Future<void> Function(generated.CoreSpace) onJoined;
   final bool autoScan;
+
+  /// Overrides the dialog title for a focused pairing purpose.
+  final String? title;
+
+  /// Overrides the body hint describing what pairing will achieve.
+  final String? hint;
+
+  /// Restricts the scanned candidates to one known device, so a per-device
+  /// entry point cannot pair a different neighbour by accident.
+  final String? onlyNodeId;
 
   /// Creates state that owns discovery results and pairing interactions.
   @override
@@ -225,9 +238,14 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
     try {
       final peers = await widget.clients.server.runtimeRemoteLinkService
           .discoverPeers(timeoutMs: 2000);
+      final onlyNodeId = widget.onlyNodeId;
       if (mounted) {
         setState(() {
-          _peers = peers;
+          _peers = onlyNodeId == null
+              ? peers
+              : peers
+                    .where((peer) => peer.nodeId == onlyNodeId)
+                    .toList(growable: false);
           _error = null;
         });
       }
@@ -241,19 +259,18 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
   /// Pairs the selected device or opens explicit address entry.
   Future<void> _pair([generated.DiscoveredPeer? peer]) async {
     if (_busy) return;
+    final l10n = AppLocalizations.of(context)!;
     _setBusy(true);
     try {
       final _RemotePairResult? result;
       if (peer == null) {
         result = await _RemotePairDialog.show(context, clients: widget.clients);
       } else {
-        // LAN 候选不携带 token；免 token 准入由 runtime/Host 实际来源判断。
         final pending = await widget.clients.server.runtimeRemoteLinkService
             .startPairing(
               address: peer.address,
               nodeId: peer.nodeId,
               transport: peerEndpointTransport(peer.address),
-              token: null,
             );
         if (!mounted) {
           await widget.clients.server.runtimeRemoteLinkService.cancelPairing(
@@ -274,6 +291,21 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
       }
       if (result != null) {
         if (!mounted) return;
+        // An admitted member needs only the direct link: the join submission
+        // would be rejected as a duplicate membership, so pairing ends here.
+        if (await _isSpaceMember(result.peer.nodeId)) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                l10n.deviceSpaceDirectLinkEstablished(result.peer.displayName),
+              ),
+            ),
+          );
+          Navigator.pop(context);
+          return;
+        }
+        if (!mounted) return;
         final space = await showSpaceJoinRequest(
           context,
           clients: widget.clients,
@@ -289,6 +321,21 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
       if (mounted) setState(() => _error = error.toString());
     } finally {
       _setBusy(false);
+    }
+  }
+
+  /// Reports whether one device already belongs to this device's Space.
+  ///
+  /// Membership is judged by the same projection the join contract uses:
+  /// the coordinator rejects a request from an already admitted device, so the
+  /// dialog must not offer a join that cannot succeed.
+  Future<bool> _isSpaceMember(String nodeId) async {
+    try {
+      final space = await widget.clients.server.runtimeRemoteLinkService
+          .deviceSpace();
+      return space.members.contains(nodeId);
+    } catch (_) {
+      return false;
     }
   }
 
@@ -437,7 +484,7 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
     final l10n = AppLocalizations.of(context)!;
     final theme = Theme.of(context);
     return OperitDialogScaffold(
-      title: l10n.deviceSpaceAddDevice,
+      title: widget.title ?? l10n.deviceSpaceAddDevice,
       maxWidth: 480,
       maxHeight: (MediaQuery.sizeOf(context).height * .8).clamp(0.0, 520.0),
       expandContent: false,
@@ -468,7 +515,7 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
             child: Padding(
               padding: const EdgeInsets.only(bottom: 16),
               child: Text(
-                l10n.devicePickerHint,
+                widget.hint ?? l10n.devicePickerHint,
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                   height: 1.5,
@@ -490,6 +537,34 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
       ),
     );
   }
+}
+
+/// Opens the shared discovery and pairing dialog for one focused purpose.
+///
+/// `title` and `hint` describe what pairing achieves - adding a device versus
+/// giving an already relayed Space member a direct link; `onlyNodeId` keeps the
+/// scan list on that one device so a per-device entry point cannot pair a
+/// different neighbour by accident. Pairing a device that already belongs to
+/// this Space completes without a join request.
+Future<void> showDeviceSpacePairingDialog(
+  BuildContext context, {
+  required GeneratedCoreProxyClients clients,
+  String? title,
+  String? hint,
+  String? onlyNodeId,
+  bool autoScan = true,
+}) async {
+  await showDialog<void>(
+    context: context,
+    builder: (_) => _AddDeviceDialog(
+      clients: clients,
+      autoScan: autoScan,
+      title: title,
+      hint: hint,
+      onlyNodeId: onlyNodeId,
+      onJoined: (_) async {},
+    ),
+  );
 }
 
 Future<generated.CoreSpace?> confirmAndJoinPairedDeviceSpace({
@@ -549,9 +624,10 @@ class _RemotePairDialog extends StatefulWidget {
 
 class _RemotePairDialogState extends State<_RemotePairDialog> {
   final TextEditingController _baseUrlController = TextEditingController();
-  final TextEditingController _tokenController = TextEditingController();
   final TextEditingController _codeController = TextEditingController();
-  generated.PeerTransport _transport = generated.PeerTransport.http;
+  // Null leaves the carrier open: the core classifies the endpoint from one
+  // throwaway probe connection, so a bare `ip:port` input is enough.
+  generated.PeerTransport? _transport;
   generated.PendingPairing? _pairing;
   bool _busy = false;
   String? _error;
@@ -560,20 +636,17 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
   @override
   void dispose() {
     _baseUrlController.dispose();
-    _tokenController.dispose();
     _codeController.dispose();
     super.dispose();
   }
 
-  /// Starts manual pairing from an explicit address and token.
+  /// Starts manual pairing from an explicit address using code confirmation.
   Future<void> _start() async {
     final l10n = AppLocalizations.of(context)!;
     final baseUrl = _baseUrlController.text.trim();
-    final token = _tokenController.text.trim();
-    if (baseUrl.isEmpty || token.isEmpty) {
+    if (baseUrl.isEmpty) {
       setState(() {
-        _error =
-            '${l10n.settingsRuntimeBaseUrl} / ${l10n.settingsRuntimePairToken}: ${l10n.required}';
+        _error = '${l10n.settingsRuntimeBaseUrl}: ${l10n.required}';
       });
       return;
     }
@@ -583,12 +656,7 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
     });
     try {
       final pairing = await widget.clients.server.runtimeRemoteLinkService
-          .startPairing(
-            address: baseUrl,
-            nodeId: '',
-            token: token,
-            transport: _transport,
-          );
+          .startPairing(address: baseUrl, nodeId: '', transport: _transport);
       if (mounted) {
         setState(() => _pairing = pairing);
       }
@@ -658,17 +726,12 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
               enabled: pairing == null,
               decoration: InputDecoration(
                 labelText: l10n.settingsRuntimeBaseUrl,
-                border: const OutlineInputBorder(),
-                isDense: true,
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _tokenController,
-              enabled: pairing == null,
-              obscureText: true,
-              decoration: InputDecoration(
-                labelText: l10n.settingsRuntimePairToken,
+                helperText: switch (_transport) {
+                  null => l10n.settingsRuntimeTransportAutoHint,
+                  generated.PeerTransport.tcp =>
+                    l10n.settingsRuntimeTcpAddressHint,
+                  _ => null,
+                },
                 border: const OutlineInputBorder(),
                 isDense: true,
               ),
@@ -858,13 +921,15 @@ class _RemotePairResult {
 class _LinkTransportSelector extends StatelessWidget {
   const _LinkTransportSelector({required this.value, required this.onChanged});
 
-  final generated.PeerTransport value;
-  final ValueChanged<generated.PeerTransport> onChanged;
+  final generated.PeerTransport? value;
+  final ValueChanged<generated.PeerTransport?> onChanged;
 
-  /// Builds the explicit Link carrier selector shared by pairing dialogs.
+  /// Builds the Link carrier selector shared by pairing dialogs; null picks
+  /// the auto-detected carrier from the address alone.
   @override
   Widget build(BuildContext context) {
-    return OperitFormStyles.dropdownButtonFormField<generated.PeerTransport>(
+    final l10n = AppLocalizations.of(context)!;
+    return OperitFormStyles.dropdownButtonFormField<generated.PeerTransport?>(
       context,
       initialValue: value,
       decoration: const InputDecoration(
@@ -872,21 +937,25 @@ class _LinkTransportSelector extends StatelessWidget {
         border: OutlineInputBorder(),
         isDense: true,
       ),
-      items: const <DropdownMenuItem<generated.PeerTransport>>[
+      items: <DropdownMenuItem<generated.PeerTransport?>>[
         DropdownMenuItem(
+          value: null,
+          child: Text(l10n.settingsRuntimeTransportAuto),
+        ),
+        const DropdownMenuItem(
           value: generated.PeerTransport.http,
           child: Text('HTTP'),
         ),
-        DropdownMenuItem(
+        const DropdownMenuItem(
           value: generated.PeerTransport.webSocket,
           child: Text('WebSocket'),
         ),
+        const DropdownMenuItem(
+          value: generated.PeerTransport.tcp,
+          child: Text('TCP'),
+        ),
       ],
-      onChanged: (selected) {
-        if (selected != null) {
-          onChanged(selected);
-        }
-      },
+      onChanged: onChanged,
     );
   }
 }

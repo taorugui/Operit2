@@ -22,9 +22,9 @@ impl CoreNodeRouter {
         request: &RoutedCoreRequest<T>,
     ) -> Result<bool, CoreLinkError> {
         // Synchronization is a same-Space operation, unlike pre-admission
-        // join calls. A member may arrive over its admitted return channel.
-        let peers = self.nodeServices().map_err(CoreLinkError::internal)?.peers().pairedPeers()?;
-        if !peers.iter().any(|p| p.nodeId == previousNodeId && (p.inbound || p.outbound))
+        // join calls. Membership is checked independently of the carrier direction.
+        let peers = self.nodeServices().map_err(CoreLinkError::internal)?.peers();
+        if !peers.hasPairing(previousNodeId, PairingDirection::Either)?
             || self.spaceChannelScope(previousNodeId)?.is_none() {
             return Err(CoreLinkError::new("PEER_NOT_AUTHORIZED", "Synchronization requires an authenticated admitted Space member"));
         }

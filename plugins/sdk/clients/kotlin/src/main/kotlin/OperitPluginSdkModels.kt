@@ -552,6 +552,8 @@ data class ToolPkgContainerRuntime(
     val manifestExtensions: Map<String, Any?>,
     val author: List<String>,
     val mainEntry: String,
+    val themes: List<ToolPkgManifestTheme>,
+    val license: String?,
     val sourceType: ToolPkgSourceType,
     val sourcePath: String,
     val subpackages: List<ToolPkgSubpackageRuntime>,
@@ -571,8 +573,10 @@ data class ToolPkgContainerRuntime(
     val chatInputHooks: List<ToolPkgFunctionHookRuntime>,
     val chatViewHooks: List<ToolPkgFunctionHookRuntime>,
     val chatMessageHooks: List<ToolPkgFunctionHookRuntime>,
+    val chatLifecycleHooks: List<ToolPkgFunctionHookRuntime>,
     val chatMessageMenuItems: List<ToolPkgChatMessageMenuItemRuntime>,
     val chatRuntimeHooks: List<ToolPkgFunctionHookRuntime>,
+    val chatResponseHooks: List<ToolPkgFunctionHookRuntime>,
     val hostEventHooks: List<ToolPkgHostEventHookRuntime>,
     val toolLifecycleHooks: List<ToolPkgFunctionHookRuntime>,
     val promptInputHooks: List<ToolPkgFunctionHookRuntime>,
@@ -605,6 +609,8 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         manifestExtensions = (input["manifestExtensions"] as Map<*, *>).entries.associate { entry -> entry.key as String to entry.value } as Map<String, Any?>,
         author = (input["author"] as List<*>).map { item -> item as String } as List<String>,
         mainEntry = input["mainEntry"] as String as String,
+        themes = (input["themes"] as List<*>).map { item -> decodeToolPkgManifestTheme(item) } as List<ToolPkgManifestTheme>,
+        license = input["license"]?.let { it as String } as String?,
         sourceType = decodeToolPkgSourceType(input["sourceType"]) as ToolPkgSourceType,
         sourcePath = input["sourcePath"] as String as String,
         subpackages = (input["subpackages"] as List<*>).map { item -> decodeToolPkgSubpackageRuntime(item) } as List<ToolPkgSubpackageRuntime>,
@@ -624,8 +630,10 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         chatInputHooks = (input["chatInputHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatViewHooks = (input["chatViewHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatMessageHooks = (input["chatMessageHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
+        chatLifecycleHooks = (input["chatLifecycleHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatMessageMenuItems = (input["chatMessageMenuItems"] as List<*>).map { item -> decodeToolPkgChatMessageMenuItemRuntime(item) } as List<ToolPkgChatMessageMenuItemRuntime>,
         chatRuntimeHooks = (input["chatRuntimeHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
+        chatResponseHooks = (input["chatResponseHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         hostEventHooks = (input["hostEventHooks"] as List<*>).map { item -> decodeToolPkgHostEventHookRuntime(item) } as List<ToolPkgHostEventHookRuntime>,
         toolLifecycleHooks = (input["toolLifecycleHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         promptInputHooks = (input["promptInputHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
@@ -658,6 +666,8 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "manifestExtensions" to this.manifestExtensions.entries.associate { entry -> entry.key to entry.value },
     "author" to this.author.map { item -> item },
     "mainEntry" to this.mainEntry,
+    "themes" to this.themes.map { item -> item.toMessagePackValue() },
+    "license" to this.license?.let { it },
     "sourceType" to this.sourceType.toMessagePackValue(),
     "sourcePath" to this.sourcePath,
     "subpackages" to this.subpackages.map { item -> item.toMessagePackValue() },
@@ -677,8 +687,10 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "chatInputHooks" to this.chatInputHooks.map { item -> item.toMessagePackValue() },
     "chatViewHooks" to this.chatViewHooks.map { item -> item.toMessagePackValue() },
     "chatMessageHooks" to this.chatMessageHooks.map { item -> item.toMessagePackValue() },
+    "chatLifecycleHooks" to this.chatLifecycleHooks.map { item -> item.toMessagePackValue() },
     "chatMessageMenuItems" to this.chatMessageMenuItems.map { item -> item.toMessagePackValue() },
     "chatRuntimeHooks" to this.chatRuntimeHooks.map { item -> item.toMessagePackValue() },
+    "chatResponseHooks" to this.chatResponseHooks.map { item -> item.toMessagePackValue() },
     "hostEventHooks" to this.hostEventHooks.map { item -> item.toMessagePackValue() },
     "toolLifecycleHooks" to this.toolLifecycleHooks.map { item -> item.toMessagePackValue() },
     "promptInputHooks" to this.promptInputHooks.map { item -> item.toMessagePackValue() },
@@ -876,6 +888,31 @@ fun ToolPkgManifestRequirement.toMessagePackValue(): Map<String, Any?> = mapOf(
     "max_version" to this.maxVersion?.let { it },
 )
 
+data class ToolPkgManifestTheme(
+    val id: String,
+    val path: String,
+    val preview: String,
+    val files: List<ManifestFile>
+)
+
+fun decodeToolPkgManifestTheme(value: Any?): ToolPkgManifestTheme {
+    val input = value as Map<*, *>
+    return ToolPkgManifestTheme(
+        id = input["id"] as String as String,
+        path = input["path"] as String as String,
+        preview = input["preview"] as String as String,
+        files = (input["files"] as List<*>).map { item -> decodeManifestFile(item) } as List<ManifestFile>,
+    )
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+fun ToolPkgManifestTheme.toMessagePackValue(): Map<String, Any?> = mapOf(
+    "id" to this.id,
+    "path" to this.path,
+    "preview" to this.preview,
+    "files" to this.files.map { item -> item.toMessagePackValue() },
+)
+
 data class ToolPkgMarketOrigin(
     val market: String,
     val toolpkgId: String,
@@ -923,6 +960,7 @@ fun ToolPkgNavigationActionHookRuntime.toMessagePackValue(): Map<String, Any?> =
 data class ToolPkgNavigationEntryRuntime(
     val id: String,
     val routeId: String,
+    val params: Any?,
     val surface: String,
     val title: LocalizedText,
     val action: ToolPkgNavigationActionHookRuntime?,
@@ -935,6 +973,7 @@ fun decodeToolPkgNavigationEntryRuntime(value: Any?): ToolPkgNavigationEntryRunt
     return ToolPkgNavigationEntryRuntime(
         id = input["id"] as String as String,
         routeId = input["routeId"] as String as String,
+        params = input["params"] as Any?,
         surface = input["surface"] as String as String,
         title = decodeLocalizedText(input["title"]) as LocalizedText,
         action = input["action"]?.let { decodeToolPkgNavigationActionHookRuntime(it) } as ToolPkgNavigationActionHookRuntime?,
@@ -947,6 +986,7 @@ fun decodeToolPkgNavigationEntryRuntime(value: Any?): ToolPkgNavigationEntryRunt
 fun ToolPkgNavigationEntryRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "id" to this.id,
     "routeId" to this.routeId,
+    "params" to this.params,
     "surface" to this.surface,
     "title" to this.title.toMessagePackValue(),
     "action" to this.action?.let { it.toMessagePackValue() },
@@ -1096,6 +1136,7 @@ data class ToolPkgUiModuleRuntime(
     val id: String,
     val runtime: String,
     val screen: String,
+    val screenExport: String?,
     val title: LocalizedText,
     val keepAlive: Boolean
 )
@@ -1106,6 +1147,7 @@ fun decodeToolPkgUiModuleRuntime(value: Any?): ToolPkgUiModuleRuntime {
         id = input["id"] as String as String,
         runtime = input["runtime"] as String as String,
         screen = input["screen"] as String as String,
+        screenExport = input["screenExport"]?.let { it as String } as String?,
         title = decodeLocalizedText(input["title"]) as LocalizedText,
         keepAlive = input["keepAlive"] as Boolean as Boolean,
     )
@@ -1116,6 +1158,7 @@ fun ToolPkgUiModuleRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "id" to this.id,
     "runtime" to this.runtime,
     "screen" to this.screen,
+    "screenExport" to this.screenExport?.let { it },
     "title" to this.title.toMessagePackValue(),
     "keepAlive" to this.keepAlive,
 )
@@ -1125,6 +1168,7 @@ data class ToolPkgUiRouteRuntime(
     val routeId: String,
     val runtime: String,
     val screen: String,
+    val screenExport: String?,
     val title: LocalizedText,
     val keepAlive: Boolean
 )
@@ -1136,6 +1180,7 @@ fun decodeToolPkgUiRouteRuntime(value: Any?): ToolPkgUiRouteRuntime {
         routeId = input["routeId"] as String as String,
         runtime = input["runtime"] as String as String,
         screen = input["screen"] as String as String,
+        screenExport = input["screenExport"]?.let { it as String } as String?,
         title = decodeLocalizedText(input["title"]) as LocalizedText,
         keepAlive = input["keepAlive"] as Boolean as Boolean,
     )
@@ -1147,6 +1192,7 @@ fun ToolPkgUiRouteRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "routeId" to this.routeId,
     "runtime" to this.runtime,
     "screen" to this.screen,
+    "screenExport" to this.screenExport?.let { it },
     "title" to this.title.toMessagePackValue(),
     "keepAlive" to this.keepAlive,
 )
@@ -1230,6 +1276,25 @@ fun ToolPkgWorkspaceTemplateRuntime.toMessagePackValue(): Map<String, Any?> = ma
     "description" to this.description.toMessagePackValue(),
     "resource_key" to this.resource_key,
     "project_type" to this.project_type,
+)
+
+data class ManifestFile(
+    val path: String,
+    val media_type: String
+)
+
+fun decodeManifestFile(value: Any?): ManifestFile {
+    val input = value as Map<*, *>
+    return ManifestFile(
+        path = input["path"] as String as String,
+        media_type = input["mediaType"] as String as String,
+    )
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+fun ManifestFile.toMessagePackValue(): Map<String, Any?> = mapOf(
+    "path" to this.path,
+    "mediaType" to this.media_type,
 )
 
 data class ToolResult(

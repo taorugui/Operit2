@@ -14,11 +14,16 @@ pub(super) struct TestPeerService {
     localNodeId: String,
     targetNodeId: String,
     endpoint: StdMutex<Option<Arc<dyn TestRouteTarget>>>,
+    pairing: StdMutex<(bool, bool)>,
     changes: tokio::sync::broadcast::Sender<()>,
 }
 impl TestPeerService {
     pub fn new(localNodeId: String, targetNodeId: String, endpoint: Arc<dyn TestRouteTarget>) -> Arc<Self> {
-        Arc::new(Self { localNodeId, targetNodeId, endpoint: StdMutex::new(Some(endpoint)), changes: tokio::sync::broadcast::channel(16).0 })
+        Arc::new(Self { localNodeId, targetNodeId, endpoint: StdMutex::new(Some(endpoint)), pairing: StdMutex::new((true, true)), changes: tokio::sync::broadcast::channel(16).0 })
+    }
+    /// Overrides the projected pairing directions of the target peer.
+    pub fn setPairingDirections(&self, inbound: bool, outbound: bool) {
+        *self.pairing.lock().unwrap() = (inbound, outbound);
     }
     pub fn attach(&self, endpoint: Arc<dyn TestRouteTarget>) {
         *self.endpoint.lock().unwrap() = Some(endpoint);
@@ -37,7 +42,8 @@ impl TestPeerService {
 #[async_trait(?Send)]
 impl RuntimePeerService for TestPeerService {
     async fn discoverPeers(&self, _: u64) -> Result<Vec<DiscoveredPeer>, CoreLinkError> { Err(Self::unsupported()) }
-    async fn startPairing(&self, _: PeerEndpoint, _: PeerTransport, _: Option<&str>) -> Result<PendingPairing, CoreLinkError> { Err(Self::unsupported()) }
+    /// Rejects pairing requests outside this routing fixture contract.
+    async fn startPairing(&self, _: PeerEndpoint, _: Option<PeerTransport>) -> Result<PendingPairing, CoreLinkError> { Err(Self::unsupported()) }
     async fn finishPairing(&self, _: &str, _: &str) -> Result<PairedPeer, CoreLinkError> { Err(Self::unsupported()) }
     async fn cancelPairing(&self, _: &str) -> Result<(), CoreLinkError> { Err(Self::unsupported()) }
     /// Declares that this routing fixture owns no listener or discovery Host.
@@ -62,7 +68,8 @@ impl RuntimePeerService for TestPeerService {
         self.endpoint(nextNodeId)?.routedOpenPush(self.localNodeId.clone(), request).await
     }
     fn pairedPeers(&self) -> Result<Vec<PairedPeer>, CoreLinkError> {
-        Ok(vec![PairedPeer { nodeId: self.targetNodeId.clone(), displayName: "Test peer".into(), inbound: true, outbound: true }])
+        let (inbound, outbound) = *self.pairing.lock().unwrap();
+        Ok(vec![PairedPeer { nodeId: self.targetNodeId.clone(), displayName: "Test peer".into(), inbound, outbound, pairingIncarnation: None }])
     }
     fn outboundPeerNodeIds(&self) -> Result<BTreeSet<String>, CoreLinkError> { Ok([self.targetNodeId.clone()].into()) }
     fn activePeerNodeIds(&self) -> Result<BTreeSet<String>, CoreLinkError> {
@@ -74,6 +81,7 @@ impl RuntimePeerService for TestPeerService {
         if peerNodeId != self.targetNodeId { return Err(Self::unsupported()); } self.close(); Ok(())
     }
     async fn removePairedPeer(&self, _: &str) -> Result<(), CoreLinkError> { Err(Self::unsupported()) }
+    fn forgetPairingRecords(&self, _: &[String]) -> Result<(), CoreLinkError> { Err(Self::unsupported()) }
 }
 
 pub(super) struct TestPeerFixture(Arc<TestPeerService>, Arc<TestPeerService>);

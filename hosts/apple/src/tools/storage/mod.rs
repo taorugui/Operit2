@@ -152,6 +152,12 @@ impl RuntimeStorageHost for AppleRuntimeStorageHost {
         ).writeBytesAtomically(path, content)
     }
 
+    fn flushFile(&self, path: &str) -> HostResult<()> {
+        operit_host_native_common::NativeRuntimeStorageHost::new(
+            self.runtimeRoot.clone(), self.workspaceRoot.clone(),
+        ).flushFile(path)
+    }
+
     /// Appends bytes to an Apple runtime storage file.
     fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
         if normalizeStoragePath(path)?.first().map(String::as_str) == Some("workspaces") {
@@ -358,7 +364,9 @@ impl RuntimeSqliteConnection for RusqliteRuntimeConnection {
     fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
         let transaction = self
             .connection
-            .transaction()
+            // Acquire the writer before reads so independent plugin connections
+            // wait instead of deadlocking during a read-to-write lock upgrade.
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| HostError::new(error.to_string()))?;
         Ok(Box::new(RusqliteRuntimeTransaction { transaction }))
     }
@@ -387,6 +395,13 @@ impl RuntimeSqliteTransaction for RusqliteRuntimeTransaction<'_> {
     fn commit(self: Box<Self>) -> HostResult<()> {
         self.transaction
             .commit()
+            .map_err(|error| HostError::new(error.to_string()))
+    }
+
+    /// Aborts the host transaction explicitly instead of relying on destructor cleanup.
+    fn rollback(self: Box<Self>) -> HostResult<()> {
+        self.transaction
+            .rollback()
             .map_err(|error| HostError::new(error.to_string()))
     }
 }

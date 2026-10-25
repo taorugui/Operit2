@@ -1,10 +1,11 @@
+use operit_host_api::PluginStorage::{StoragePreferencesMergeCatalog, StoragePreferencesMergeDescriptor, StoragePreferencesMergeKey, StoragePreferencesMergeReference};
+use operit_store::PreferenceMerge::PreferenceMergeStore;
 use operit_store::PreferencesDataStore::{
     stringPreferencesKey, Flow, Preferences, PreferencesDataStore, PreferencesDataStoreError,
 };
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
 use uuid::Uuid;
 
-use crate::data::preferences::CharacterCardManager::CharacterCardManager;
 use operit_local_models::LocalEngineManifest::LocalPlatformTarget;
 use operit_local_models::LocalModelManifest::{LocalModelDriver, LocalModelKind};
 use operit_local_models::LocalModelRegistryStore::LocalModelRegistryStore;
@@ -24,13 +25,63 @@ pub struct TtsConfigManager {
 }
 
 impl TtsConfigManager {
-    const PREFERENCES_VERSION: u32 = 1;
+    /// Opens this owner's versioned store through the supplied runtime storage host.
+    pub(crate) fn preferenceStore(
+        storage: std::sync::Arc<dyn operit_host_api::RuntimeStorageHost>,
+        path: impl Into<String>,
+    ) -> PreferencesDataStore {
+        PreferencesDataStore::newEncryptedWithStorage(storage, path)
+            .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences)
+    }
+
+    /// Decodes historical record encodings without running new-store initialization.
+    fn decodeSyncedEntry(entry: &mut operit_store::PreferencesDataStore::PreferencesSyncedEntry) -> Result<(), PreferencesDataStoreError> {
+        entry.decodeHistoricalValues(|version, values| {
+            if version > Self::PREFERENCES_VERSION {
+                return Err(PreferencesDataStoreError::SchemaVersionTooNew { actual: version, expected: Self::PREFERENCES_VERSION });
+            }
+            for version in version.max(1)..Self::PREFERENCES_VERSION { Self::migratePreferences(version, values)?; }
+            Ok(())
+        })
+    }
+
+    /// Declares this owner's catalog and references using the shared merge contract.
+    pub(crate) fn spaceMergeStore() -> PreferenceMergeStore {
+        let path = operit_util::RuntimeStorageLayout::TTS_CONFIGS_PREFERENCES_PATH;
+        PreferenceMergeStore {
+            path: path.to_string(),
+            encrypted: true,
+            storageVersion: Some(3),
+            decode: Some(Self::decodeSyncedEntry),
+            merge: StoragePreferencesMergeDescriptor {
+                version: 1,
+                catalog: Some(StoragePreferencesMergeCatalog {
+                    key_prefix: "tts_config_".to_string(),
+                    key_suffix: "_json".to_string(),
+                    identity_field: "id".to_string(),
+                    name_field: "name".to_string(),
+                    ignored_fields: vec!["createdAt".to_string(), "updatedAt".to_string()],
+                    retired_keys: vec!["tts_config_list".to_string()],
+                }),
+                references: vec![StoragePreferencesMergeReference {
+                    key: StoragePreferencesMergeKey::Exact { key: "current_tts_config_id".to_string() },
+                    path: vec![],
+                    target: path.to_string(),
+                }],
+                projection: None,
+            },
+        }
+    }
+
+    const PREFERENCES_VERSION: u32 = 3;
 
     /// Creates a text-to-speech configuration manager backed by runtime store paths.
     pub fn new(paths: RuntimeStorePaths) -> Self {
         Self {
-            dataStore: PreferencesDataStore::newEncrypted(paths.tts_configs_preferences_path())
-                .withSchema(Self::PREFERENCES_VERSION, Self::migratePreferences),
+            dataStore: Self::preferenceStore(
+                operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
+                operit_store::RuntimeStorageHost::runtimeStoragePath(&paths.tts_configs_preferences_path()),
+            ),
             paths,
         }
     }
@@ -150,11 +201,6 @@ impl TtsConfigManager {
         self.dataStore
             .try_edit_result(|preferences| -> Result<(), PreferencesDataStoreError> {
                 assertTtsConfigVoiceDoesNotExist(preferences, &config, None)?;
-                let mut list = readConfigList(preferences)?;
-                list.push(id.clone());
-                list.sort();
-                list.dedup();
-                writeConfigList(preferences, &list);
                 writeTtsConfig(preferences, &config);
                 Ok(())
             })
@@ -376,36 +422,29 @@ impl TtsConfigManager {
             .dataFlow()
             .first()
             .map_err(|error| error.to_string())?
-            .get(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())
+            .getTyped::<String>(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())
+            .map_err(|error| error.to_string())?
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         if currentConfigId.as_deref() == Some(id.as_str()) {
             return Err("current tts config cannot be deleted".to_string());
         }
-        let cardManager = CharacterCardManager::new(self.paths.clone());
-        let cards = cardManager
-            .getAllCharacterCards()
-            .map_err(|error| error.to_string())?;
-        if let Some(card) = cards
-            .iter()
-            .find(|card| card.ttsConfigId.as_deref() == Some(id.as_str()))
-        {
-            return Err(format!("tts config is used by character card: {}", card.id));
-        }
-        let mut list = self
-            .ttsConfigListFlow()
-            .first()
-            .map_err(|error| error.to_string())?;
-        let originalLen = list.len();
-        list.retain(|entry| entry != &id);
-        let deleted = list.len() != originalLen;
         self.dataStore
-            .edit(|preferences| {
-                writeConfigList(preferences, &list);
+            .try_edit_result(|preferences| -> Result<bool, PreferencesDataStoreError> {
+                if preferences
+                    .getTyped::<String>(&Self::CURRENT_TTS_CONFIG_ID())?
+                    .as_deref()
+                    == Some(id.as_str())
+                {
+                    return Err(PreferencesDataStoreError::Message(
+                        "current tts config cannot be deleted".into(),
+                    ));
+                }
+                let existed = preferences.contains(&configJsonKey(&id));
                 preferences.remove(&configJsonKey(&id));
+                Ok(existed)
             })
-            .map_err(|error| error.to_string())?;
-        Ok(deleted)
+            .map_err(|error| error.to_string())
     }
 
     /// Migrates legacy TTS preferences and creates the default system profile once.
@@ -416,19 +455,65 @@ impl TtsConfigManager {
         match version {
             0 => {
                 let hasCurrentConfig = preferences
-                    .get(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())
+                    .getTyped::<String>(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())?
                     .is_some_and(|value| !value.trim().is_empty());
-                let list = readConfigList(preferences)?;
+                let list = preferences
+                    .getTyped::<String>(&Self::TTS_CONFIG_LIST())?
+                    .map(|encoded| serde_json::from_str::<Vec<String>>(&encoded))
+                    .transpose()?
+                    .unwrap_or_default();
                 if hasCurrentConfig || !list.is_empty() {
                     return Ok(());
                 }
-                let config = defaultSystemTtsConfig(currentTimeMillis());
-                writeConfigList(preferences, &[DEFAULT_SYSTEM_TTS_CONFIG_ID.to_string()]);
-                writeTtsConfig(preferences, &config);
+                let config = defaultSystemTtsConfig(0);
+                preferences.set(
+                    &Self::TTS_CONFIG_LIST(),
+                    serde_json::to_string(&[DEFAULT_SYSTEM_TTS_CONFIG_ID])?,
+                );
+                preferences.set(&configJsonKey(&config.id), serde_json::to_string(&config)?);
                 preferences.set(
                     &TtsConfigManager::CURRENT_TTS_CONFIG_ID(),
                     DEFAULT_SYSTEM_TTS_CONFIG_ID.to_string(),
                 );
+                Ok(())
+            }
+            1 => {
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix("tts_config_")?.strip_suffix("_json")?;
+                        Some((key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in records {
+                    let encoded = serde_json::from_value::<String>(value)?;
+                    let record: serde_json::Value = serde_json::from_str(&encoded)?;
+                    let config: TtsConfig = serde_json::from_value(record.clone())?;
+                    let id = key
+                        .strip_prefix("tts_config_")
+                        .and_then(|id| id.strip_suffix("_json"))
+                        .expect("configuration record key selected by this migration");
+                    if config.id != id {
+                        return Err(PreferencesDataStoreError::Message(format!(
+                            "Configuration record identity mismatch: {key}"
+                        )));
+                    }
+                    preferences.set(&stringPreferencesKey(&key), record);
+                }
+                preferences.remove(&Self::TTS_CONFIG_LIST());
+                Ok(())
+            }
+            2 => {
+                let key = configJsonKey(DEFAULT_SYSTEM_TTS_CONFIG_ID);
+                if let Some(value) = preferences.get(&key) {
+                    let mut config: TtsConfig = serde_json::from_value(value.clone())?;
+                    config.createdAt = 0;
+                    config.updatedAt = 0;
+                    let normalized = serde_json::to_value(&config)?;
+                    if normalized == serde_json::to_value(defaultSystemTtsConfig(0))? {
+                        preferences.set(&key, normalized);
+                    }
+                }
                 Ok(())
             }
             from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
@@ -436,23 +521,32 @@ impl TtsConfigManager {
     }
 }
 
+/// Derives TTS membership directly from complete records and validates their identities.
 fn readConfigList(preferences: &Preferences) -> Result<Vec<String>, PreferencesDataStoreError> {
-    let Some(raw) = preferences.get(&TtsConfigManager::TTS_CONFIG_LIST()) else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_str::<Vec<String>>(raw).map_err(PreferencesDataStoreError::from)
+    let mut configs = Vec::new();
+    for (key, value) in preferences.iterEntries() {
+        let Some(id) = key
+            .strip_prefix("tts_config_")
+            .and_then(|id| id.strip_suffix("_json"))
+        else {
+            continue;
+        };
+        let config: TtsConfig = serde_json::from_value(value.clone())?;
+        if config.id != id {
+            return Err(PreferencesDataStoreError::Message(format!(
+                "TTS record identity mismatch: {key}"
+            )));
+        }
+        configs.push(config.id);
+    }
+    configs.sort();
+    Ok(configs)
 }
 
-fn writeConfigList(preferences: &mut Preferences, list: &[String]) {
-    preferences.set(
-        &TtsConfigManager::TTS_CONFIG_LIST(),
-        serde_json::to_string(list).expect("tts config list must serialize"),
-    );
-}
-
+/// Reads the selected TTS identity and verifies its record exists.
 fn readCurrentTtsConfigId(preferences: &Preferences) -> Result<String, PreferencesDataStoreError> {
     let raw = preferences
-        .get(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())
+        .getTyped::<String>(&TtsConfigManager::CURRENT_TTS_CONFIG_ID())?
         .ok_or_else(|| {
             PreferencesDataStoreError::Message("current tts config id missing".to_string())
         })?;
@@ -471,6 +565,7 @@ fn readCurrentTtsConfigId(preferences: &Preferences) -> Result<String, Preferenc
     Ok(id)
 }
 
+/// Loads and validates a complete native JSON TTS configuration.
 fn readExistingTtsConfig(
     preferences: &Preferences,
     id: &str,
@@ -490,7 +585,8 @@ fn readExistingTtsConfig(
     let raw = preferences.get(&configJsonKey(id)).ok_or_else(|| {
         PreferencesDataStoreError::Message(format!("tts config payload missing: {id}"))
     })?;
-    let config = serde_json::from_str::<TtsConfig>(raw).map_err(PreferencesDataStoreError::from)?;
+    let config = serde_json::from_value::<TtsConfig>(raw.clone())
+        .map_err(PreferencesDataStoreError::from)?;
     normalizeConfig(config).map_err(PreferencesDataStoreError::Message)
 }
 
@@ -518,10 +614,11 @@ fn assertTtsConfigVoiceDoesNotExist(
     Ok(())
 }
 
+/// Writes the complete native JSON TTS configuration.
 fn writeTtsConfig(preferences: &mut Preferences, config: &TtsConfig) {
     preferences.set(
         &configJsonKey(&config.id),
-        serde_json::to_string(config).expect("tts config must serialize"),
+        serde_json::to_value(config).expect("tts config must serialize"),
     );
 }
 
@@ -589,7 +686,8 @@ fn configJsonKey(id: &str) -> operit_store::PreferencesDataStore::PreferencesKey
 }
 
 #[allow(non_snake_case)]
-fn normalizeConfig(config: TtsConfig) -> Result<TtsConfig, String> {
+/// Validates and canonicalizes a TTS configuration before storage or import matching.
+pub(crate) fn normalizeConfig(config: TtsConfig) -> Result<TtsConfig, String> {
     let name = config.name.trim().to_string();
     if name.is_empty() {
         return Err("tts config name is empty".to_string());

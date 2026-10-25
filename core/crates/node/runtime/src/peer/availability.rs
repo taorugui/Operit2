@@ -5,7 +5,6 @@ use operit_store::NetworkControlStore::NetworkControlStore;
 use tokio::sync::oneshot;
 
 const DISCOVERY_INTERVAL_MS: u64 = 3_000;
-const CONNECT_DEADLINE_MS: u64 = 30_000;
 const MAX_CONNECTING_PEERS: usize = 4;
 
 pub(super) struct AvailabilityWorker {
@@ -50,7 +49,7 @@ impl HostRuntimePeerService {
                                 if let Some(state) = state.upgrade() {
                                     HostRuntimePeerService { state }.refreshPeerAvailability(&node);
                                 }
-                                operit_util::AppLogger::AppLogger::trace("RuntimePeerService", &format!("Peer connection attempt failed peer={node} error={error}"));
+                                operit_util::AppLogger::AppLogger::v_with_level("RuntimePeerService", &format!("Peer connection attempt failed peer={node} error={error}"), operit_util::AppLogger::VERBOSE_LEVEL_3);
                             }
                         }
                     }
@@ -76,18 +75,15 @@ impl HostRuntimePeerService {
                                 continue;
                             }
                             if connecting.contains(&peer.nodeId) || service.hasLiveChannel(&peer.nodeId) { continue; }
-                            if !(peer.outbound || service.spaceOutbound(&peer.nodeId).is_ok()) { continue; }
+                            if !peer.outbound { continue; }
                             if connecting.len() >= MAX_CONNECTING_PEERS.min(service.state.limits.concurrentProbes) { break; }
                             let node = peer.nodeId;
                             lastPeer = Some(node.clone());
                             connecting.insert(node.clone());
                             let service = service.clone();
-                            let tasks = tasks.clone();
                             pending.push(Box::pin(async move {
-                                let result = tokio::select! {
-                                    result = service.acquirePooledChannel(&node) => result.map(drop),
-                                    _ = tasks.waitForHostRuntimeDelay(CONNECT_DEADLINE_MS) => Err(CoreLinkError::new("PEER_CONNECT_TIMEOUT", "Authenticated connection establishment timed out")),
-                                };
+                                // The acquisition carries its own connect deadline.
+                                let result = service.acquireChannel(&node).await.map(drop);
                                 (node, result)
                             }));
                         }
@@ -109,19 +105,4 @@ impl HostRuntimePeerService {
             let _ = done.await;
         }
     }
-}
-
-/// Established reusable sessions use the channel's own bounded exchange. This
-/// keeps correlation, cancellation safety and close-on-timeout in one place.
-pub(super) async fn probeConnectedSession(channel: &Channel) -> Result<(), CoreLinkError> {
-    if channel.duplex().is_some() {
-        let id = nextCoreRouteRequestId("serial-ping");
-        match channel.exchange(CoreLinkRequest::Call(CoreCallRequest::new(
-            id.clone(), "$peer.keepalive", "ping", CoreValue::Null,
-        ))).await? {
-            CoreLinkResponse::Call(CoreCallResponse { requestId, result: Ok(CoreValue::Null) }) if requestId.0 == id => {},
-            _ => { channel.close().await; return Err(error("Serial keepalive response mismatch")); }
-        }
-    }
-    Ok(())
 }

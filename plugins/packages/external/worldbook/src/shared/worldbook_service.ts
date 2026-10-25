@@ -1,5 +1,4 @@
 import {
-  ensureWorldBookStorage,
   readWorldBookEntries,
   readWorldBookGroups,
   writeWorldBookEntries,
@@ -878,8 +877,10 @@ export async function toggleWorldBookEntry(id: string): Promise<WorldBookListEnt
 }
 
 export async function listWorldBookCharacterCards(): Promise<CharacterCardOption[]> {
-  const result = await Tools.Chat.listCharacterCards();
-  const cards = Array.isArray(result?.cards) ? (result.cards as CharacterCardSummary[]) : [];
+  const cards = await ToolPkg.callDependency<Record<string, never>, CharacterCardSummary[]>(
+    "com.operit.character_cards", "character.list", {}
+  );
+  if (!Array.isArray(cards)) throw new Error("Character plugin returned an invalid directory");
   return cards
     .map((card) => ({
       id: String(card?.id || "").trim(),
@@ -1015,5 +1016,3 @@ export async function updateWorldBookGroup(params: WorldBookGroupMutationParams)
   await writeWorldBookGroups(groups);
   return groups[index];
 }
-
-void ensureWorldBookStorage();

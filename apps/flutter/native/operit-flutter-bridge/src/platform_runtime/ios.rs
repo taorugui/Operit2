@@ -73,7 +73,8 @@ pub(crate) fn startup_device_info(
             .getDeviceInfo()
             .map_err(|error| error.to_string())?
             .model,
-    })
+    pairingIncarnation: None,
+})
 }
 
 /// Resolves iOS storage roots from the native storage host.
@@ -105,4 +106,11 @@ impl crate::OperitFlutterBridge {
             metadata: StartupMetadata::HostProvided,
         })
     }
+}
+
+/// Creates only the platform secret-store adapter without starting Core or owner services.
+pub(crate) fn rescue_secret_store(default_runtime: &std::path::Path) -> Result<Option<std::sync::Arc<dyn operit_host_api::HostSecretStore>>, String> {
+    Ok(Some(std::sync::Arc::new(operit_host_ios_native::IosRuntimeStorageHost::new(
+        default_runtime.to_path_buf(), default_runtime.with_file_name("workspaces"),
+    ))))
 }

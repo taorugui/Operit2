@@ -86,6 +86,8 @@ pub mod RuntimePeerService;
 pub mod HostRuntimePeerService;
 #[cfg(feature = "peer-runtime")]
 pub mod NodeSpaceService;
+#[cfg(feature = "peer-runtime")]
+mod space_policy;
 pub mod NodeServices;
 #[cfg(feature = "peer-state")]
 pub mod PeerStateStore;
@@ -93,6 +95,7 @@ pub mod PeerStateStore;
 pub mod RuntimeRemoteLinkService;
 #[cfg(feature = "full")]
 pub mod SpacePersistenceSyncService;
+pub mod SpaceDoctor;
 #[cfg(feature = "full")]
 mod PeerSync;
 #[cfg(feature = "full")]

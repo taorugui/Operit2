@@ -29,9 +29,10 @@ impl ToolPkgMessageProcessingBridge {
         MessageProcessingPluginRegistry::register(Arc::new(MessageProcessingBridge { runtime }));
     }
 
+    /// Synchronizes this bridge from the committed active package catalog.
     #[allow(non_snake_case)]
-    pub fn syncToolPkgRegistrations(activeContainers: Vec<ToolPkgContainerRuntime>) {
-        let mut hooks = activeContainers
+    pub fn syncToolPkgRegistrations(activeContainers: &[ToolPkgContainerRuntime]) {
+        let hooks = activeContainers
             .iter()
             .flat_map(|container| {
                 container.messageProcessingPlugins.iter().map(|hook| {
@@ -44,20 +45,16 @@ impl ToolPkgMessageProcessingBridge {
                 })
             })
             .collect::<Vec<_>>();
-        hooks.sort_by(|left, right| {
-            left.containerPackageName
-                .cmp(&right.containerPackageName)
-                .then(left.pluginId.cmp(&right.pluginId))
-        });
         let hookCount = hooks.len();
         *MESSAGE_PROCESSING_HOOKS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .expect("toolpkg message processing hook mutex poisoned") = hooks;
-        ChainLogger::info(
+        ChainLogger::verbose_with_level(
             PLUGIN_CHAIN,
             "plugin.toolpkg.message_processing.sync",
             &[("hookCount", hookCount.to_string())],
+            operit_util::AppLogger::VERBOSE_LEVEL_4,
         );
     }
 }
@@ -96,7 +93,7 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
             let probeEventPayload = buildMessageEventPayload(params, true);
             let manager = self.runtime.package_manager();
             for hook in hooks {
-                ChainLogger::info(
+                ChainLogger::verbose_with_level(
                     PLUGIN_CHAIN,
                     "plugin.toolpkg.message_processing.probe.start",
                     &[
@@ -104,6 +101,7 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                         ("hookId", hook.pluginId.clone()),
                         ("function", hook.functionName.clone()),
                     ],
+                    operit_util::AppLogger::VERBOSE_LEVEL_3,
                 );
                 let probeDecoded = runMessageProcessingHook(
                     &manager,
@@ -120,13 +118,14 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                 if !probeResult.matched {
                     continue;
                 }
-                ChainLogger::info(
+                ChainLogger::verbose_with_level(
                     PLUGIN_CHAIN,
                     "plugin.toolpkg.message_processing.probe.matched",
                     &[
                         ("package", hook.containerPackageName.clone()),
                         ("hookId", hook.pluginId.clone()),
                     ],
+                    operit_util::AppLogger::VERBOSE_LEVEL_3,
                 );
 
                 let executionId = format!(
@@ -150,7 +149,6 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                 let executionIdForWorker = executionId.clone();
                 let released = Arc::new(AtomicBool::new(false));
                 let released_for_worker = released.clone();
-                manager.acquireToolPkgExecutionEngine(&executionId, &hook.containerPackageName);
                 self.runtime
                     .host_manager()
                     .hostRuntimeTaskSchedulerHost
@@ -162,7 +160,23 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                         "operit-toolpkg-message-processing",
                         Box::new(move || {
                             Box::pin(async move {
-                                ChainLogger::info(
+                                if released_for_worker.load(Ordering::Acquire) {
+                                    stream_for_final.close();
+                                    return;
+                                }
+                                if let Err(error) = manager_for_worker.acquireToolPkgExecutionEngine(&executionIdForWorker, &hook_for_worker.containerPackageName).await {
+                                    ChainLogger::error(PLUGIN_CHAIN, "plugin.toolpkg.message_processing.initialize.error", &[
+                                        ("package", hook_for_worker.containerPackageName.clone()), ("error", error),
+                                    ]);
+                                    stream_for_final.close();
+                                    return;
+                                }
+                                if released_for_worker.load(Ordering::Acquire) {
+                                    manager_for_worker.releaseToolPkgExecutionEngine(&executionIdForWorker, &hook_for_worker.containerPackageName);
+                                    stream_for_final.close();
+                                    return;
+                                }
+                                ChainLogger::verbose_with_level(
                                     PLUGIN_CHAIN,
                                     "plugin.toolpkg.message_processing.run.start",
                                     &[
@@ -170,6 +184,7 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                                         ("hookId", hook_for_worker.pluginId.clone()),
                                         ("executionId", executionIdForWorker.clone()),
                                     ],
+                                    operit_util::AppLogger::VERBOSE_LEVEL_3,
                                 );
                                 let emittedAny = Arc::new(AtomicBool::new(false));
                                 let emittedAnyForIntermediate = emittedAny.clone();
@@ -202,7 +217,7 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                                         }
                                     }
                                 }
-                                ChainLogger::info(
+                                ChainLogger::verbose_with_level(
                                     PLUGIN_CHAIN,
                                     "plugin.toolpkg.message_processing.run.done",
                                     &[
@@ -211,6 +226,7 @@ impl MessageProcessingPlugin for MessageProcessingBridge {
                                         ("executionId", executionIdForWorker.clone()),
                                         ("chunkCount", emittedChunkCount.to_string()),
                                     ],
+                                    operit_util::AppLogger::VERBOSE_LEVEL_3,
                                 );
                                 stream_for_final.close();
                                 releaseMessageProcessingEngine(

@@ -18,6 +18,7 @@ import '../web_visit/WebVisitBridge.dart';
 import '../web_visit/WebVisitModels.dart';
 import 'AppToastController.dart';
 import 'ComposeDslFilePickerService.dart';
+import 'ComposeDslFileSaveService.dart';
 import 'ComposeWebViewControllerBridge.dart';
 import 'browser/RuntimeBrowserSessionRegistry.dart';
 
@@ -64,6 +65,7 @@ class RuntimeHostInteractionSubscriber {
         RuntimeHostInteractionKind.webVisit,
         RuntimeHostInteractionKind.composeWebViewController,
         RuntimeHostInteractionKind.composeFilePicker,
+        RuntimeHostInteractionKind.composeFileSave,
         RuntimeHostInteractionKind.systemCaptureScreenshot,
         RuntimeHostInteractionKind.systemLanguageCode,
         RuntimeHostInteractionKind.systemRecognizeText,
@@ -113,9 +115,10 @@ class RuntimeHostInteractionSubscriber {
           },
           onDone: () {
             _releaseSubscription(subscription);
-            ClientLogger.d(
+            ClientLogger.v(
               'owner host interaction stream closed',
               tag: 'RuntimeHostInteraction',
+              verboseLevel: VerboseLevel.level4,
             );
           },
           cancelOnError: true,
@@ -223,6 +226,9 @@ class RuntimeHostInteractionSubscriber {
         ),
       RuntimeHostInteractionKind.composeFilePicker => _handleComposeFilePicker(
         _requirePayload(request.composeFilePicker, request.kind),
+      ),
+      RuntimeHostInteractionKind.composeFileSave => _handleComposeFileSave(
+        _requirePayload(request.composeFileSave, request.kind),
       ),
       RuntimeHostInteractionKind.systemCaptureScreenshot =>
         _handleSystemCaptureScreenshot(),
@@ -371,7 +377,7 @@ class RuntimeHostInteractionSubscriber {
 
   /// Logs one compact browser interaction host timing summary.
   static void _logBrowserInteractHostSummary(_BrowserInteractHostStats stats) {
-    ClientLogger.d(
+    ClientLogger.v(
       'host summary elapsedMs=${stats.windowStopwatch.elapsedMilliseconds} '
       'accepted=${stats.count} errors=${stats.errorCount} '
       'avgAcceptUs=${_averageMicroseconds(stats.totalAcceptElapsedUs, stats.count)} '
@@ -384,6 +390,7 @@ class RuntimeHostInteractionSubscriber {
       'maxRoundTripUs=${stats.maxRoundTripElapsedUs} '
       'slowestSession=${stats.slowestSessionId}',
       tag: _browserInputLogTag,
+      verboseLevel: VerboseLevel.level3,
     );
   }
 
@@ -435,6 +442,20 @@ class RuntimeHostInteractionSubscriber {
     );
     return _response(
       composeFilePicker: RuntimeHostInteractionComposeFilePickerResponse(
+        resultJson: resultJson,
+      ),
+    );
+  }
+
+  /// Saves one Compose DSL export through the platform owner.
+  static Future<RuntimeHostInteractionResponse> _handleComposeFileSave(
+    RuntimeHostInteractionComposeFileSavePayload payload,
+  ) async {
+    final resultJson = await ComposeDslFileSaveService.save(
+      payload.requestJson,
+    );
+    return _response(
+      composeFileSave: RuntimeHostInteractionComposeFileSaveResponse(
         resultJson: resultJson,
       ),
     );
@@ -500,7 +521,8 @@ class RuntimeHostInteractionSubscriber {
   }
 
   /// Reads one foreground location through the Flutter geolocation plugin.
-  static Future<RuntimeHostInteractionResponse> _handleForegroundLocationOperation(
+  static Future<RuntimeHostInteractionResponse>
+  _handleForegroundLocationOperation(
     RuntimeHostInteractionSystemOperationPayload payload,
   ) async {
     final decoded = jsonDecode(payload.paramsJson);
@@ -773,6 +795,7 @@ class RuntimeHostInteractionSubscriber {
     RuntimeHostInteractionComposeWebViewControllerResponse?
     composeWebViewController,
     RuntimeHostInteractionComposeFilePickerResponse? composeFilePicker,
+    RuntimeHostInteractionComposeFileSaveResponse? composeFileSave,
     RuntimeHostInteractionSystemCaptureScreenshotResponse?
     systemCaptureScreenshot,
     RuntimeHostInteractionSystemLanguageCodeResponse? systemLanguageCode,
@@ -794,6 +817,7 @@ class RuntimeHostInteractionSubscriber {
       webVisit: webVisit,
       composeWebViewController: composeWebViewController,
       composeFilePicker: composeFilePicker,
+      composeFileSave: composeFileSave,
       systemCaptureScreenshot: systemCaptureScreenshot,
       systemLanguageCode: systemLanguageCode,
       systemRecognizeText: systemRecognizeText,

@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::javascript::JsAssetLoader::{
     loadAndroidUtilsJs, loadOkHttp3Js, loadPluginConfigJs, loadRuntimeContextJs, loadUINodeJs,
 };
@@ -6,128 +8,88 @@ use crate::javascript::JsInitRuntimeScriptBuilder;
 use crate::javascript::JsJavaBridge::buildJavaClassBridgeDefinition;
 use operit_plugin_sdk::toolpkg::ToolPkgApiRuntimeScript::buildToolPkgApiRuntimeScript;
 use operit_plugin_sdk::toolpkg::ToolPkgComposeDslBridge::buildComposeDslContextBridgeDefinition;
+use operit_plugin_sdk::toolpkg::ToolPkgComposeDslRuntimeScript::buildComposeDslRuntimeWrappedScript;
 use operit_plugin_sdk::toolpkg::ToolPkgRegistrationBridge::buildToolPkgRegistrationBridgeScript;
 use operit_plugin_sdk::JsExecutionScriptBuilder;
 use operit_plugin_sdk::JsTools::getJsToolsDefinition;
 use operit_util::RuntimeStorageLayout::{RUNTIME_CLEAN_ON_EXIT_DIR_PATH, RUNTIME_ROOT_PATH_PREFIX};
 
-/// JavaScript bootstrap module loaded into the QuickJS runtime.
-pub struct JsBootstrapModule {
-    pub fileName: String,
-    pub source: String,
-    pub globals: Vec<String>,
+/// Describes one trusted library whose public exports initialize together.
+struct JsLazyLibrary {
+    file_name: &'static str,
+    globals: &'static [&'static str],
+    load: fn() -> String,
 }
 
-impl JsBootstrapModule {
-    /// Creates a bootstrap module descriptor with its expected global exports.
-    pub fn new(fileName: &str, source: String, globals: &[&str]) -> Self {
-        Self {
-            fileName: fileName.to_string(),
-            source,
-            globals: globals.iter().map(|global| global.to_string()).collect(),
-        }
-    }
+const LAZY_LIBRARIES: &[JsLazyLibrary] = &[
+    JsLazyLibrary {
+        file_name: "assets/js/CryptoJS.js",
+        globals: &["CryptoJS"],
+        load: loadCryptoJs,
+    },
+    JsLazyLibrary {
+        file_name: "assets/js/Jimp.js",
+        globals: &["Jimp"],
+        load: loadJimpJs,
+    },
+    JsLazyLibrary {
+        file_name: "assets/js/UINode.js",
+        globals: &["UINode"],
+        load: loadUINodeJs,
+    },
+    JsLazyLibrary {
+        file_name: "assets/js/AndroidUtils.js",
+        globals: &[
+            "Android",
+            "PackageManager",
+            "ContentProvider",
+            "SystemManager",
+            "DeviceController",
+        ],
+        load: loadAndroidUtilsJs,
+    },
+    JsLazyLibrary {
+        file_name: "assets/js/OkHttp3.js",
+        globals: &[
+            "OkHttpClientBuilder",
+            "OkHttpClient",
+            "RequestBuilder",
+            "OkHttp",
+        ],
+        load: loadOkHttp3Js,
+    },
+    JsLazyLibrary {
+        file_name: "assets/js/pako.js",
+        globals: &["pako"],
+        load: loadPakoJs,
+    },
+];
+
+/// Recreates the eager policy only for an explicit performance comparison.
+#[cfg(test)]
+pub(crate) fn buildEagerLibraryProbeSource() -> String {
+    LAZY_LIBRARIES.iter().map(|library| (library.load)()).collect::<Vec<_>>().join("\n")
 }
 
-#[allow(non_snake_case)]
-/// Builds the ordered bootstrap module list required by the JavaScript runtime.
-pub fn buildRuntimeBootstrapModules() -> Vec<JsBootstrapModule> {
-    vec![
-        JsBootstrapModule::new(
-            "quickjs/init/runtime.js",
-            JsInitRuntimeScriptBuilder::buildRuntimeBootstrapScript(),
-            &[],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/operit-paths.js",
-            buildOperitPathsBootstrapScript(),
-            &["OPERIT_CLEAN_ON_EXIT_DIR"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/execution-runtime.js",
-            JsExecutionScriptBuilder::buildExecutionRuntimeBridgeScript(),
-            &[],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/toolpkg-api-runtime.js",
-            buildToolPkgApiRuntimeScript(),
-            &["__operitToolPkgApi"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/toolpkg-bridge.js",
-            buildToolPkgRegistrationBridgeScript(false),
-            &["ToolPkg"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/tools.js",
-            getJsToolsDefinition().to_string(),
-            &["Tools", "tools"],
-        ),
-        JsBootstrapModule::new(
-            "assets/js/PluginConfig.js",
-            loadPluginConfigJs(),
-            &["PluginConfig"],
-        ),
-        JsBootstrapModule::new(
-            "assets/js/RuntimeContext.js",
-            loadRuntimeContextJs(),
-            &["RuntimeContext", "withContext"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/compose-dsl-bridge.js",
-            buildComposeDslContextBridgeDefinition(),
-            &["OperitComposeDslRuntime"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/java-bridge.js",
-            buildJavaClassBridgeDefinition(),
-            &["Java", "Kotlin"],
-        ),
-        JsBootstrapModule::new(
-            "quickjs/init/third-party-libs.js",
-            getJsThirdPartyLibraries(),
-            &["_", "dataUtils", "Icons"],
-        ),
-        JsBootstrapModule::new("assets/js/CryptoJS.js", loadCryptoJs(), &["CryptoJS"]),
-        JsBootstrapModule::new("assets/js/Jimp.js", loadJimpJs(), &["Jimp"]),
-        JsBootstrapModule::new("assets/js/UINode.js", loadUINodeJs(), &["UINode"]),
-        JsBootstrapModule::new(
-            "assets/js/AndroidUtils.js",
-            loadAndroidUtilsJs(),
-            &[
-                "Android",
-                "PackageManager",
-                "ContentProvider",
-                "SystemManager",
-                "DeviceController",
-            ],
-        ),
-        JsBootstrapModule::new(
-            "assets/js/OkHttp3.js",
-            loadOkHttp3Js(),
-            &[
-                "OkHttpClientBuilder",
-                "OkHttpClient",
-                "RequestBuilder",
-                "OkHttp",
-            ],
-        ),
-        JsBootstrapModule::new("assets/js/pako.js", loadPakoJs(), &["pako"]),
-    ]
+/// Resolves only an exact trusted bootstrap library identity.
+pub(crate) fn loadBootstrapLibrary(name: &str) -> Result<String, String> {
+    let library = LAZY_LIBRARIES
+        .iter()
+        .find(|library| library.file_name == name)
+        .ok_or_else(|| format!("Unknown bootstrap library: {name}"))?;
+    Ok((library.load)())
 }
 
-#[allow(non_snake_case)]
-fn buildOperitPathsBootstrapScript() -> String {
-    let cleanOnExitDirJson = serde_json::to_string(&cleanOnExitVfsPath())
-        .expect("clean-on-exit VFS path must serialize");
+/// Installs export accessors without reading or compiling unused library sources.
+pub(crate) fn buildLazyLibraryBootstrapScript() -> String {
+    let descriptors: Vec<_> = LAZY_LIBRARIES
+        .iter()
+        .map(|library| (library.file_name, library.globals))
+        .collect();
     format!(
-        r#"
-        var OPERIT_CLEAN_ON_EXIT_DIR = {};
-        if (typeof __operitExpose === 'function') {{
-            __operitExpose('OPERIT_CLEAN_ON_EXIT_DIR', OPERIT_CLEAN_ON_EXIT_DIR);
-        }}
-        "#,
-        cleanOnExitDirJson
+        "{}\n__operitInstallBootstrapLibraries({});",
+        include_str!("JsLazyLibraries.script.js"),
+        serde_json::to_string(&descriptors).expect("bootstrap descriptors must serialize")
     )
 }
 
@@ -220,7 +182,15 @@ pub fn getJsThirdPartyLibraries() -> String {
 
 #[allow(non_snake_case)]
 /// Builds the host-backed JavaScript bootstrap and scoped runtime services.
-pub fn buildRuntimeBootstrapScript() -> String {
+pub fn buildRuntimeBootstrapScript() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(assembleRuntimeBootstrapScript).as_str()
+}
+
+/// Assembles immutable runtime sources once, independently of page identity and host bindings.
+fn assembleRuntimeBootstrapScript() -> String {
+    let composeRuntimeJson = serde_json::to_string(&buildComposeDslRuntimeWrappedScript(""))
+        .expect("Compose runtime source must serialize");
     let executionPreludeJson =
         serde_json::to_string(&JsExecutionScriptBuilder::buildExecutionPreludeSource())
             .expect("Execution prelude source must serialize");
@@ -231,12 +201,21 @@ pub fn buildRuntimeBootstrapScript() -> String {
         {}
         var globalThis = this;
         var window = globalThis;
+        var global = globalThis;
         var OPERIT_CLEAN_ON_EXIT_DIR = {};
         var __operitRuntimePrelude = {};
+        var __operitComposeRuntimeSource = {};
         {}
         var console = {{
             log: function() {{ __operitNativeLog('info', String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments).join(' ')); }},
             info: function() {{ __operitNativeLog('info', String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments).join(' ')); }},
+            /** Writes explicit developer diagnostics at Debug severity. */
+            debug: function() {{ __operitNativeLog('debug', String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments).join(' ')); }},
+            /** Writes diagnostics at the same V1-V6 depth as the Rust and Flutter loggers. */
+            verbose: function(level) {{
+                if (!Number.isInteger(level) || level < 1 || level > 6) throw new RangeError('Verbose level must be an integer from 1 to 6');
+                __operitNativeLogVerbose(level, String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments, 1).join(' '));
+            }},
             warn: function() {{ __operitNativeLog('warn', String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments).join(' ')); }},
             error: function() {{ __operitNativeLog('error', String(globalThis.__operitCurrentCallId || ''), Array.prototype.slice.call(arguments).join(' ')); }}
         }};
@@ -478,31 +457,28 @@ pub fn buildRuntimeBootstrapScript() -> String {
             ];
         }}
 
+        /** Computes the existing UTF-16 cache fingerprint through the shared Host callback. */
         function __operitHashText(value) {{
-            var textValue = String(value == null ? '' : value);
-            var hash = 0;
-            for (var i = 0; i < textValue.length; i += 1) {{
-                hash = (((hash << 5) - hash) + textValue.charCodeAt(i)) | 0;
-            }}
-            return (hash >>> 0).toString(16);
+            return __operitNativeHashText(String(value == null ? '' : value));
         }}
 
         function __operitBuildFactoryKey(kind, identity, source) {{
             return [String(kind || ''), String(identity || ''), String(source || '').length, __operitHashText(source)].join(':');
         }}
 
-        function __operitGetFactory(kind, identity, source) {{
-            var key = __operitBuildFactoryKey(kind, identity, source);
+        function __operitGetFactory(kind, identity, source, composeCompilation) {{
+            var key = __operitBuildFactoryKey(kind, identity, source) + ":compose=" + composeCompilation;
             var cache = __operitGetFactoryCache();
             if (typeof cache[key] === 'function') {{
                 return cache[key];
             }}
-            var factory = new Function(
-                'module',
-                'exports',
-                'require',
-                '__operit_call_runtime',
-                __operitRuntimePrelude + '\n' + source
+            var preparedSource = source;
+            if (composeCompilation) {{
+                var artifact = OperitComposeArtifact.read(source);
+                preparedSource = artifact === null ? __operitNativePrepareComposeModule(source, identity) : artifact;
+            }}
+            var factory = __operitNativeCompileModuleFactory(
+                __operitRuntimePrelude + '\n' + (composeCompilation ? preparedSource + (kind === 'main' ? '\n' + __operitComposeRuntimeSource : '') : source)
             );
             cache[key] = factory;
             return factory;
@@ -542,6 +518,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                 return null;
             }}
             ScreenPlaceholder.__operit_toolpkg_module_path = modulePath;
+            ScreenPlaceholder.__operit_toolpkg_export_name = "default";
             return ScreenPlaceholder;
         }}
 
@@ -580,9 +557,22 @@ pub fn buildRuntimeBootstrapScript() -> String {
             return names;
         }}
 
-        /** Runs one script inside its owning session using direct structured host operations. */
+        var __operitScriptSources = new Map();
 
-        function __operitExecuteScriptFunction(callId, params, scriptText, targetFunctionName, timeoutSec, preTimeoutMs) {{
+        /** Retains one immutable source under its realm-owned native identifier. */
+        function __operitRegisterScriptSource(sourceId, scriptText) {{
+            if (typeof sourceId !== 'string' || typeof scriptText !== 'string' || __operitScriptSources.has(sourceId)) {{
+                throw new Error('Invalid or duplicate script source registration');
+            }}
+            __operitScriptSources.set(sourceId, scriptText);
+        }}
+
+        /** Invokes a registered source without transferring or fingerprinting its text again. */
+        function __operitExecuteScriptFunction(callId, params, sourceId, targetFunctionName, structuredResult) {{
+            var scriptText = __operitScriptSources.get(sourceId);
+            if (typeof scriptText !== 'string') {{
+                throw new Error('Unknown registered script source: ' + sourceId);
+            }}
             var previousCallRuntime = globalThis.__operit_call_runtime_ref;
             var previousCallId = globalThis.__operitCurrentCallId;
             var registerCallSession = globalThis.__operitRegisterCallSession;
@@ -602,17 +592,12 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     ? globalThis.__operitGetCallState(callId)
                     : null;
             }}
+            /** Restores the surviving context and retires this call after its owned work ends. */
             function finalizeCall() {{
                 if (globalThis.__operitCurrentCallId === callId) {{
-                    globalThis.__operitCurrentCallId =
-                        typeof previousCallId === 'string' ? previousCallId : '';
-                }}
-                if (globalThis.__operit_call_runtime_ref === callRuntime) {{
-                    if (previousCallRuntime && typeof previousCallRuntime === 'object') {{
-                        globalThis.__operit_call_runtime_ref = previousCallRuntime;
-                    }} else {{
-                        delete globalThis.__operit_call_runtime_ref;
-                    }}
+                    globalThis.__operitRestoreCallContext(
+                        globalThis.__operitRestoreLiveCallId(previousCallId, callId)
+                    );
                 }}
                 if (callState.pendingReferences > 0) {{
                     callState.detached = true;
@@ -635,7 +620,17 @@ pub fn buildRuntimeBootstrapScript() -> String {
                 var value = currentParams ? currentParams[key] : undefined;
                 return value == null || value === '' ? defaultValue : __operitText(value);
             }}
+            var profileComposeStages = structuredResult === true && params && params.__operit_profile_compose_stages === true;
+            var profileStageStarted = profileComposeStages ? Date.now() : 0;
+            var profileStageName = 'prepare-module';
             function markStage(stage) {{
+                if (profileComposeStages) {{
+                    var now = Date.now();
+                    console.verbose(4, 'event=compose_pipeline_stage stage=js-stage-' + profileStageName +
+                        ' durationMs=' + (now - profileStageStarted) + ' wallMicros=' + (now * 1000) + ' call=' + callId);
+                    profileStageStarted = now;
+                    profileStageName = stage;
+                }}
                 callState.lastExecStage = __operitText(stage);
                 __operitNativeLogJsExecutionTrace(
                     callId,
@@ -678,7 +673,11 @@ pub fn buildRuntimeBootstrapScript() -> String {
                 if (!state || state.resultCompleted) {{
                     return;
                 }}
-                __operitNativeSetCallResult(callId, resultValue);
+                if (structuredResult) {{
+                    __operitNativeSetCallStructuredResult(callId, resultValue);
+                }} else {{
+                    __operitNativeSetCallResult(callId, resultValue);
+                }}
                 state.resultCompleted = true;
                 state.completed = Number(state.pendingReferences || 0) <= 0;
                 try {{
@@ -721,7 +720,11 @@ pub fn buildRuntimeBootstrapScript() -> String {
             /** Forwards intermediate application values directly to the structured host listener binding. */
             function emitIntermediate(value) {{
                 if (isActive()) {{
-                    __operitSendIntermediateResult(callId, value === undefined ? null : value);
+                    if (structuredResult) {{
+                        __operitNativeSendStructuredIntermediate(callId, __operitNormalizeComposeResult(value));
+                    }} else {{
+                        __operitSendIntermediateResult(callId, value === undefined ? null : value);
+                    }}
                 }}
             }}
             /** Completes a structured result or reports the original conversion failure. */
@@ -747,13 +750,27 @@ pub fn buildRuntimeBootstrapScript() -> String {
                 log: emitIntermediate,
                 update: emitIntermediate,
                 sendIntermediateResult: emitIntermediate,
+                /** Registers a subscription cleanup for the exact originating call session. */
+                onCleanup: function(cleanup) {{
+                    if (typeof cleanup !== 'function') {{ throw new TypeError('Call cleanup must be a function'); }}
+                    callState.cleanupCallbacks.add(cleanup);
+                    /** Releases a disposed subscription before its call finishes. */
+                    return function() {{ callState.cleanupCallbacks.delete(cleanup); }};
+                }},
+                /** Transfers the sealed Compose allocation on its owning call channel. */
+                sendComposeResponse: function(phase, response) {{
+                    if (!isActive()) {{ throw new Error('Compose response owner is no longer active'); }}
+                    __operitNativeSendStructuredIntermediate(callId, response);
+                }},
+                reportError: emitError,
                 done: complete,
                 complete: complete,
                 getState: function() {{ return readCallValue('__operit_package_state', undefined); }},
                 getLang: function() {{ return readCallValue('__operit_package_lang', 'en'); }},
                 getCallerName: function() {{ return readCallValue('__operit_package_caller_name', undefined); }},
                 getChatId: function() {{ return readCallValue('__operit_package_chat_id', undefined); }},
-                getCallerCardId: function() {{ return readCallValue('__operit_package_caller_card_id', undefined); }},
+                /** Returns the opaque authenticated participant without a card alias or another namespace. */
+                getCallerParticipantId: function() {{ return readCallValue('__operit_package_caller_participant_id', undefined); }},
                 getEnv: function(key) {{
                     var value = __operitNativeGetEnvForCall(callId, __operitText(key).trim());
                     return value == null || value === '' ? undefined : __operitText(value);
@@ -1158,6 +1175,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                 }}
 
                 ensureToolPkgIpcApi();
+                __operitInstallToolPkgRouteApi();
                 if (!registrationMode) {{
                     ensureToolPkgWasmApi();
                 }}
@@ -1168,7 +1186,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     globalThis.RuntimeContext.__operitEnsureContextRunnerRegistered();
                 }}
                 var moduleCache = registrationMode ? {{}} : __operitGetModuleInstanceCache();
-                var mainModuleKey = ['instance', 'main', packageTarget + ':' + screenPath, String(scriptText || '').length, __operitHashText(scriptText)].join(':');
+                var mainModuleKey = ['instance', 'main', packageTarget + ':' + screenPath, sourceId, 'compose=' + structuredResult].join(':');
                 var module = moduleCache[mainModuleKey];
                 var exports = module && module.exports ? module.exports : null;
                 /** Reads CommonJS candidates from the execution resource owner and preserves empty modules. */
@@ -1187,7 +1205,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     return null;
                 }}
                 function executeModule(modulePath, moduleText, requireInternal) {{
-                    var moduleKey = ['instance', 'module', packageTarget + ':' + modulePath, String(moduleText || '').length, __operitHashText(moduleText)].join(':');
+                    var moduleKey = ['instance', 'module', packageTarget + ':' + modulePath, String(moduleText || '').length, __operitHashText(moduleText), 'compose=' + structuredResult].join(':');
                     if (moduleCache[moduleKey]) {{
                         return moduleCache[moduleKey].exports;
                     }}
@@ -1205,7 +1223,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     var localRequire = function(nextName) {{
                         return requireInternal(nextName, modulePath);
                     }};
-                    var factory = __operitGetFactory('module', packageTarget + ':' + modulePath, moduleText);
+                    var factory = __operitGetFactory('module', packageTarget + ':' + modulePath, moduleText, structuredResult);
                     var previousActiveModule = globalThis.__operitActiveModule;
                     var previousActiveExports = globalThis.__operitActiveModuleExports;
                     var previousModule = callState.currentModule;
@@ -1281,7 +1299,7 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     moduleCache[mainModuleKey] = module;
                     exports = module.exports;
                     markStage('compile_main_script');
-                    var mainFactory = __operitGetFactory('main', packageTarget + ':' + screenPath, scriptText);
+                    var mainFactory = __operitGetFactory('main', packageTarget + ':' + screenPath + ':' + sourceId, scriptText, structuredResult);
                     markStage('execute_main_script');
                     var previousActiveModule = globalThis.__operitActiveModule;
                     var previousActiveExports = globalThis.__operitActiveModuleExports;
@@ -1353,6 +1371,10 @@ pub fn buildRuntimeBootstrapScript() -> String {
                     globalThis.__operitActiveModuleExports = invokePreviousActiveExports;
                 }}
                 markStage('handle_function_result');
+                // A nested call may have left the shared cursor on its own id; handleAsync
+                // must subscribe the returned promise to this call, not to that nested one.
+                globalThis.__operitCurrentCallId = callId;
+                globalThis.__operit_call_runtime_ref = callRuntime;
                 if (!callRuntime.handleAsync(functionResult)) {{
                     complete(functionResult);
                 }}
@@ -1377,15 +1399,11 @@ pub fn buildRuntimeBootstrapScript() -> String {
         {}
         {}
         {}
-        {}
-        {}
-        {}
-        {}
-        {}
         "#,
         JsInitRuntimeScriptBuilder::buildRuntimeBootstrapScript(),
         cleanOnExitDirJson,
         executionPreludeJson,
+        composeRuntimeJson,
         buildJavaClassBridgeDefinition(),
         buildComposeDslContextBridgeDefinition(),
         buildToolPkgApiRuntimeScript(),
@@ -1394,12 +1412,8 @@ pub fn buildRuntimeBootstrapScript() -> String {
         getJsThirdPartyLibraries(),
         loadPluginConfigJs(),
         loadRuntimeContextJs(),
-        loadCryptoJs(),
-        loadJimpJs(),
-        loadUINodeJs(),
-        loadAndroidUtilsJs(),
-        loadOkHttp3Js(),
-        loadPakoJs(),
-        JsExecutionScriptBuilder::buildExecutionRuntimeBridgeScript()
+        buildLazyLibraryBootstrapScript(),
+        format!("{}\n{}\n__operitInstallV1Runtime(globalThis);", include_str!("../../../sdk/src/js_sdk/toolpkg_route_runtime.js"),
+            JsExecutionScriptBuilder::buildExecutionRuntimeBridgeScript())
     )
 }

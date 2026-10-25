@@ -14,14 +14,16 @@ use operit_node_runtime::RuntimeRemoteLinkService::{
 use operit_util::GithubReleaseUtil::FullUpdateStage;
 
 use super::app::{
-    join_status_label, network_hub_rows, peer_transport_label, space_join_is_active,
-    DeviceManagerAction, DeviceManagerMode, DeviceManagerModal, DeviceManagerRow, FocusArea,
-    FullUpdateDownloadState, NetworkHubModal, NetworkHubRow, OperitTui, PairField, PairStage,
-    PAIR_WIZARD_TRANSPORTS, StartupInstallState,
+    hub_member_status_label, join_status_label, network_hub_rows, peer_transport_label,
+    space_join_is_active,
+    ControlPanelMode, ControlPanelTab, DeviceManagerAction, DeviceManagerMode, DeviceManagerModal,
+    DeviceManagerRow, FocusArea, FullUpdateDownloadState, NetworkHubModal, NetworkHubRow, OperitTui,
+    PairField, PairStage, PAIR_WIZARD_TRANSPORTS, StartupInstallState,
 };
 use crate::cli::network_control_ui::{network_device_label_by_id, network_role_summary};
 use super::helpers::{
-    centered_rect, display_width, short_chat_label, transcript_max_scroll, wrap_approx_lines,
+    centered_rect, display_width, resolve_transcript_scroll, short_chat_label,
+    transcript_max_scroll, wrap_approx_lines,
 };
 use super::pending_queue::{
     pending_queue_preview_text, pending_queue_visible_items, pending_queue_visible_range,
@@ -92,10 +94,6 @@ impl OperitTui {
             self.render_model_chooser(frame);
         }
 
-        if self.show_list_popup {
-            self.render_list_popup(frame);
-        }
-
         if self.show_config_popup {
             self.config_ui.render(frame, self.text());
             self.popup_selection_rect = self.config_ui.selection_rect;
@@ -128,6 +126,13 @@ impl OperitTui {
             self.render_network_hub(frame);
         }
 
+        // The hub opens list popups (discover, audit, policy, token, leave,
+        // unpair); they render above the panel and take keys first, so they
+        // behave like the device window instead of being hidden behind it.
+        if self.show_list_popup {
+            self.render_list_popup(frame);
+        }
+
         if self.device_manager.is_some() {
             self.render_device_manager(frame);
         }
@@ -138,6 +143,10 @@ impl OperitTui {
 
         if self.join_decision.is_some() {
             self.render_join_decision_modal(frame);
+        }
+
+        if self.control_panel.is_some() {
+            self.render_control_panel(frame);
         }
 
         self.finish_popup_selection(frame.buffer_mut());
@@ -248,12 +257,10 @@ impl OperitTui {
         let max_scroll = transcript_max_scroll(&transcript_lines, area);
         self.transcript_viewport_height = area.height.saturating_sub(2).max(1);
         self.transcript_max_scroll = max_scroll;
-        if self.follow_transcript {
-            self.transcript_scroll = max_scroll;
-        } else if self.transcript_scroll > max_scroll {
-            self.transcript_scroll = max_scroll;
-            self.follow_transcript = true;
-        }
+        let (scroll, follows) =
+            resolve_transcript_scroll(self.follow_transcript, self.transcript_scroll, max_scroll);
+        self.transcript_scroll = scroll;
+        self.follow_transcript = follows;
 
         let block = Block::default()
             .title(self.text().conversation_title())
@@ -602,6 +609,269 @@ impl OperitTui {
                 )));
         }
         frame.render_stateful_widget(list, areas[2], &mut state);
+    }
+
+    /// Renders the headless control panel: tab bar, list or detail body,
+    /// status line, footer, and the confirm/input overlays.
+    fn render_control_panel(&mut self, frame: &mut Frame) {
+        let Some((tab, mode, selected, detail_scroll, rows_empty)) =
+            self.control_panel.as_ref().map(|panel| {
+                (
+                    panel.tab,
+                    panel.mode,
+                    panel.selected,
+                    panel.detail_scroll,
+                    panel.rows.is_empty(),
+                )
+            })
+        else {
+            return;
+        };
+        let popup = centered_rect(90, 85, frame.area());
+        frame.render_widget(Clear, popup);
+        let title = match tab {
+            ControlPanelTab::Status => self.text().control_status_title(),
+            ControlPanelTab::Packages => self.text().control_packages_title(),
+            ControlPanelTab::Plugins => self.text().control_plugins_title(),
+            ControlPanelTab::Skills => self.text().control_skills_title(),
+            ControlPanelTab::Mcp => self.text().control_mcp_title(),
+            ControlPanelTab::Logs => self.text().control_logs_title(),
+            ControlPanelTab::Identities => self.text().control_identities_title(),
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::ACCENT));
+        let inner = block.inner(popup);
+        self.popup_selection_rect = Some(inner);
+        frame.render_widget(block, popup);
+
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let tabs = ControlPanelTab::ALL
+            .iter()
+            .map(|candidate| {
+                let label = match candidate {
+                    ControlPanelTab::Status => self.text().control_status_title(),
+                    ControlPanelTab::Packages => self.text().control_packages_title(),
+                    ControlPanelTab::Plugins => self.text().control_plugins_title(),
+                    ControlPanelTab::Skills => self.text().control_skills_title(),
+                    ControlPanelTab::Mcp => self.text().control_mcp_title(),
+                    ControlPanelTab::Logs => self.text().control_logs_title(),
+                    ControlPanelTab::Identities => self.text().control_identities_title(),
+                };
+                if *candidate == tab {
+                    Span::styled(
+                        format!(" {label} "),
+                        Style::default()
+                            .fg(theme::TEXT_INVERTED)
+                            .bg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled(
+                        format!(" {label} "),
+                        Style::default().fg(theme::TEXT_SUBTLE),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Line::from(tabs)), areas[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(areas[1].width as usize),
+                Style::default().fg(theme::TEXT_SUBTLE),
+            ))),
+            areas[1],
+        );
+
+        let show_detail = mode == ControlPanelMode::Detail
+            || matches!(tab, ControlPanelTab::Status | ControlPanelTab::Logs);
+        if show_detail {
+            let lines = self
+                .control_panel
+                .as_ref()
+                .map(|panel| {
+                    if tab == ControlPanelTab::Logs && mode != ControlPanelMode::Detail {
+                        panel.log_lines.clone()
+                    } else {
+                        panel.detail_lines.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let paragraph = Paragraph::new(
+                lines
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .scroll((detail_scroll, 0))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, areas[2]);
+        } else if rows_empty {
+            frame.render_widget(
+                Paragraph::new(self.text().control_no_rows())
+                    .alignment(ratatui::layout::Alignment::Center),
+                areas[2],
+            );
+        } else {
+            let items = self
+                .control_panel
+                .as_ref()
+                .map(|panel| {
+                    panel
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            let marker = if row.issue {
+                                "!"
+                            } else if row.loadable {
+                                "+"
+                            } else if row.enabled == Some(true) {
+                                "●"
+                            } else if row.enabled == Some(false) {
+                                "○"
+                            } else {
+                                "·"
+                            };
+                            ListItem::new(vec![
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!("{marker} "),
+                                        Style::default().fg(theme::ACCENT),
+                                    ),
+                                    Span::styled(
+                                        row.label.clone(),
+                                        Style::default().add_modifier(Modifier::BOLD),
+                                    ),
+                                ]),
+                                Line::from(Span::styled(
+                                    format!("  {}", row.detail),
+                                    Style::default().fg(theme::TEXT_SUBTLE),
+                                )),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let list = List::new(items)
+                .highlight_style(
+                    Style::default()
+                        .bg(theme::ACCENT_BG)
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ");
+            let mut state = ListState::default();
+            if !self
+                .control_panel
+                .as_ref()
+                .map(|panel| panel.rows.is_empty())
+                .unwrap_or(true)
+            {
+                state.select(Some(selected));
+            }
+            frame.render_stateful_widget(list, areas[2], &mut state);
+        }
+
+        let status = self
+            .control_panel
+            .as_ref()
+            .and_then(|panel| panel.status.clone())
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                status,
+                Style::default().fg(theme::TEXT_SUBTLE),
+            ))),
+            areas[3],
+        );
+        let footer = match mode {
+            ControlPanelMode::Confirm => self.text().control_footer_confirm(),
+            ControlPanelMode::ImportInput => self.text().control_footer_import(),
+            ControlPanelMode::IdentityNameInput => self.text().control_footer_identity_name(),
+            ControlPanelMode::IdentityCapsInput => self.text().control_footer_identity_caps(),
+            ControlPanelMode::Detail => self.text().control_footer_detail(),
+            ControlPanelMode::Browse => match tab {
+                ControlPanelTab::Status => self.text().control_footer_status(),
+                ControlPanelTab::Logs => self.text().control_footer_logs(),
+                ControlPanelTab::Identities => self.text().control_footer_identity(),
+                _ => self.text().control_footer_browse(),
+            },
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                footer,
+                Style::default().fg(theme::TEXT_SUBTLE),
+            ))),
+            areas[4],
+        );
+
+        match mode {
+            ControlPanelMode::Confirm => {
+                let (label, hint) = self
+                    .control_panel
+                    .as_ref()
+                    .map(|panel| {
+                        (
+                            panel.confirm_label.clone(),
+                            self.text().control_footer_confirm().to_string(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let confirm = centered_rect(50, 20, frame.area());
+                frame.render_widget(Clear, confirm);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(label, Style::default().add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from(hint),
+                    ])
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(theme::ACCENT)),
+                    )
+                    .wrap(Wrap { trim: true })
+                    .alignment(ratatui::layout::Alignment::Center),
+                    confirm,
+                );
+            }
+            ControlPanelMode::ImportInput
+            | ControlPanelMode::IdentityNameInput
+            | ControlPanelMode::IdentityCapsInput => {
+                let (label, input) = self
+                    .control_panel
+                    .as_ref()
+                    .map(|panel| (panel.input_label.clone(), panel.input.clone()))
+                    .unwrap_or_default();
+                let input_popup = centered_rect(60, 20, frame.area());
+                frame.render_widget(Clear, input_popup);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(label, Style::default().add_modifier(Modifier::BOLD))),
+                        Line::from(format!("> {input}_")),
+                    ])
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(theme::ACCENT)),
+                    )
+                    .wrap(Wrap { trim: true }),
+                    input_popup,
+                );
+            }
+            _ => {}
+        }
     }
 
     fn render_list_popup(&mut self, frame: &mut Frame) {
@@ -1193,17 +1463,11 @@ impl OperitTui {
             Span::styled(format!("{}: ", text.network_join_decision_space()), label_style),
             Span::raw(request.spaceName.clone()),
             Span::styled("  ·  ", Style::default().fg(theme::TEXT_MUTED)),
-            Span::styled(format!("{:?}", request.status), Style::default()),
+            Span::styled(
+                join_status_label(text, &request.status).to_string(),
+                Style::default(),
+            ),
         ]));
-        if let Some(reviewer) = request.reviewerName.as_deref() {
-            body_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{}: ", text.network_join_decision_reviewer()),
-                    label_style,
-                ),
-                Span::raw(reviewer.to_string()),
-            ]));
-        }
         if modal.requests.len() > 1 {
             body_lines.push(Line::from(""));
             body_lines.push(Line::from(Span::styled(
@@ -1328,9 +1592,19 @@ impl OperitTui {
                 todo_lines.push(Line::from(Span::raw(
                     text.network_hub_todo_outbound_join(
                         &request.targetDeviceId,
-                        join_status_label(&request.status),
+                        join_status_label(text, &request.status),
                     ),
                 )));
+            }
+        }
+        // A restricted member (or this device itself) waits on a human
+        // decision: nobody comes back until it is admitted.
+        for device in &hub.topology.devices {
+            if hub.blocked.contains(&device.deviceId) {
+                todo_lines.push(Line::from(vec![
+                    Span::styled("▸ ", Style::default().fg(theme::ERROR_DIM)),
+                    Span::raw(text.network_hub_todo_restricted(&device.deviceName)),
+                ]));
             }
         }
         if !hub.initialized {
@@ -1376,11 +1650,7 @@ impl OperitTui {
                     item_for_row.push(items.len());
                     items.push(ListItem::new(vec![self.hub_member_line(hub, device)]));
                 }
-                NetworkHubRow::Peer {
-                    deviceId,
-                    label,
-                    outbound,
-                } => {
+                NetworkHubRow::Peer { deviceId, label } => {
                     if !peers_header_drawn {
                         peers_header_drawn = true;
                         items.push(ListItem::new(section_header_line(
@@ -1388,11 +1658,7 @@ impl OperitTui {
                         )));
                     }
                     item_for_row.push(items.len());
-                    let hint = if *outbound {
-                        text.network_hub_peer_joinable()
-                    } else {
-                        text.network_hub_peer_inbound_only()
-                    };
+                    let hint = text.network_hub_peer_joinable();
                     items.push(ListItem::new(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)),
@@ -1439,8 +1705,9 @@ impl OperitTui {
         device: &RuntimeDeviceSpaceDevice,
     ) -> Line<'static> {
         let text = self.text();
+        let blocked = hub.blocked.contains(&device.deviceId);
         if device.deviceId == hub.topology.currentDeviceId {
-            return Line::from(vec![
+            let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(
                     text.network_devices_self().to_string(),
@@ -1450,13 +1717,20 @@ impl OperitTui {
                     format!(" · {}", device.platform),
                     Style::default().fg(theme::TEXT_SUBTLE),
                 ),
-            ]);
+            ];
+            // Being restricted by another administrator is exactly the state
+            // this device cannot infer from reachability alone.
+            if blocked {
+                spans.push(Span::styled(
+                    format!(" · {}", text.network_hub_member_restricted()),
+                    Style::default().fg(theme::ERROR_DIM),
+                ));
+            }
+            return Line::from(spans);
         }
-        let status = if device.online {
-            String::new()
-        } else {
-            text.network_devices_offline().to_string()
-        };
+        let status = hub_member_status_label(text, blocked, device.online)
+            .map(|status| format!(" · {status}"))
+            .unwrap_or_default();
         let identity = device
             .currentIdentity
             .as_ref()
@@ -1473,12 +1747,12 @@ impl OperitTui {
                 Style::default().fg(theme::TEXT_SUBTLE),
             ),
             Span::styled(
-                if status.is_empty() {
-                    status
+                status,
+                Style::default().fg(if blocked {
+                    theme::ERROR_DIM
                 } else {
-                    format!(" · {status}")
-                },
-                Style::default().fg(theme::TEXT_SUBTLE),
+                    theme::TEXT_SUBTLE
+                }),
             ),
         ])
     }
@@ -1522,7 +1796,16 @@ impl OperitTui {
                 } else {
                     format!("  {transport_label}  ")
                 };
-                let body = Paragraph::new(vec![
+                let mut lines = Vec::new();
+                // A wizard opened from a device row dials one known device;
+                // show which one, so the address cannot be typed by accident.
+                if let Some(label) = wizard.expectedLabel.as_deref() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{} {}", text.network_pair_wizard_target(), label),
+                        Style::default().fg(theme::TEXT_MUTED),
+                    )));
+                }
+                lines.extend([
                     Line::from(vec![
                         Span::styled(
                             format!("{} ", text.network_pair_wizard_address()),
@@ -1543,26 +1826,13 @@ impl OperitTui {
                             field_style(wizard.field == PairField::Transport),
                         ),
                     ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{} ", text.network_pair_wizard_token()),
-                            field_style(wizard.field == PairField::Token),
-                        ),
-                        Span::styled(
-                            format!("{}▏", wizard.token),
-                            field_style(wizard.field == PairField::Token),
-                        ),
-                        Span::styled(
-                            format!(" ({})", text.network_pair_wizard_token_optional()),
-                            Style::default().fg(theme::TEXT_SUBTLE),
-                        ),
-                    ]),
                     blank_line(),
                     Line::from(Span::styled(
                         text.network_pair_wizard_start_hint(),
                         Style::default().fg(theme::TEXT_SUBTLE),
                     )),
                 ]);
+                let body = Paragraph::new(lines);
                 frame.render_widget(body, chunks[0]);
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -1845,6 +2115,31 @@ impl OperitTui {
                 .style(Style::default().fg(theme::ERROR_DIM));
                 frame.render_widget(warning, chunks[0]);
             }
+            DeviceManagerMode::ConfirmUnpair => {
+                let label = modal
+                    .menu_device_id
+                    .as_ref()
+                    .map(|id| match modal
+                        .topology
+                        .devices
+                        .iter()
+                        .find(|device| &device.deviceId == id)
+                    {
+                        Some(device) => device_manager_device_label(modal, device),
+                        None => id.clone(),
+                    })
+                    .unwrap_or_default();
+                let warning_text = text.network_unpair_warning(&label);
+                let warning = Paragraph::new(Text::from(
+                    warning_text
+                        .split('\n')
+                        .map(Line::from)
+                        .collect::<Vec<_>>(),
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(theme::ERROR_DIM));
+                frame.render_widget(warning, chunks[0]);
+            }
         }
 
         if !modal.initialized {
@@ -1859,7 +2154,7 @@ impl OperitTui {
             DeviceManagerMode::ActionMenu => text.network_devices_menu_hint(),
             DeviceManagerMode::AssignIdentity => text.network_devices_assign_hint(),
             // The confirm body already ends with the Y/N hint.
-            DeviceManagerMode::ConfirmRemove => "",
+            DeviceManagerMode::ConfirmRemove | DeviceManagerMode::ConfirmUnpair => "",
         };
         if !hint_text.is_empty() {
             let hint = Paragraph::new(Line::from(Span::styled(
@@ -1960,6 +2255,7 @@ fn device_manager_device_label(
 
 fn device_manager_action_label(text: super::i18n::TuiText, action: DeviceManagerAction) -> &'static str {
     match action {
+        DeviceManagerAction::Pair => text.network_devices_menu_pair(),
         DeviceManagerAction::Admit => text.network_devices_menu_admit(),
         DeviceManagerAction::Disconnect => text.network_devices_menu_disconnect(),
         DeviceManagerAction::AssignIdentity => text.network_devices_menu_assign(),

@@ -8,6 +8,15 @@ Build outputs and transient logs belong under `tools/release/work` and
 `tools/release/dist`. Private credentials belong under `tools/release/secrets`.
 These ignored directories are not used to store reusable build scripts.
 
+Release package filenames use
+`operit2-<product>-<platform>-<architecture>-<release-version>.<extension>`.
+`release_artifacts.py` validates the shared App runtime and CLI version and keeps
+prerelease identifiers and compound extensions intact. App packages for macOS
+use `universal` and `.zip`; macOS CLI packages use their target architecture and
+`.tar.gz`. Build and verification scripts must not write separate `.sha256`
+files or `SHA256SUMS` lists for release packages. Verification results may
+include hashes in the existing build manifest.
+
 ## Entry points
 
 - `build_flutter_<platform>.py`: Flutter builds for Android, iOS, Linux, macOS,
@@ -19,6 +28,39 @@ These ignored directories are not used to store reusable build scripts.
 - `build_esp32.py`: ESP32 firmware builder.
 - `check_build_environment.py`: shared local/CI environment checker.
 - `common.py`, `cli_common.py`, and `appstore_connect_common.py`: shared helpers.
+
+## Generated plugin assets
+
+Every App/CLI build embeds the ToolPkg assets generated from `plugins/packages/`
+into `core/crates/runtime/application/assets/plugins/{buildin,external}`.
+`prepare_plugin_assets()` in `common.py` runs
+`plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload`; the
+CLI entry points call it before `cargo build`, and Flutter builds trigger it
+from their native hooks. `verify_cli_plugin_assets()` rejects a packaged CLI
+whose binary omits any generated asset name. Do not commit or reuse stale
+asset directories across machines.
+
+## OpenHarmony native libraries
+
+The HAP build uses the API 18 native SDK configured in the OHOS project's
+`local.properties` and a current `ld.lld` on `PATH`. V8's Chromium compiler emits
+ELF CREL relocations, which the SDK's bundled LLD 15 cannot read. The final Rust
+link uses the selected LLD with the SDK sysroot and compiler builtins, and rejects
+undefined symbols.
+
+Provide a V8 archive and its matching generated Rust bindings for
+`aarch64-unknown-linux-ohos` through `RUSTY_V8_ARCHIVE` and
+`RUSTY_V8_SRC_BINDING_PATH`. Set `RUSTY_V8_ARCHIVE_SHA256` to the archive's SHA-256.
+Both artifacts must come from the locked V8 version, built against the OHOS
+sysroot; Android and GNU/Linux artifacts have a different ABI.
+
+Local native source caches can be supplied through `OPERIT_LLAMA_SOURCE`,
+`OPERIT_MNN_SOURCE`, and `OPERIT_KLEIDIAI_SOURCE` (KleidiAI 1.16.0 for MNN 3.6.1).
+Use CMake-style forward slashes in these paths. The OHOS engine uses the SDK's
+C++ headers, aligns their namespace with the SDK's `__n1` ABI, and uses
+`sched_setaffinity` for inference thread affinity. Its static C++ runtime stays
+private behind the three exported inference C functions. Packaging includes both `liboperit_flutter_bridge.so` and
+`liboperit_local_llm.so`.
 
 ## Apple release helpers
 
@@ -38,3 +80,105 @@ python3 tools/build_scripts/upload_appstore.py path/to/App.ipa
 The App Store Connect scripts read the ignored file
 `tools/release/secrets/appstoreconnect/appstoreconnect.env`. No credentials are
 stored in tracked build scripts.
+
+## iOS V8 runtime
+
+The iOS Rust bridge runs `prepare_ios_v8.py` before compiling Rust. It builds the
+V8 version pinned in the bridge's `Cargo.lock` from source and supplies the
+resulting static library and generated Rust bindings together. The embedded
+startup snapshot comes from that same build. This avoids the incompatible
+snapshot in the previously used precompiled iOS archive.
+
+The iOS build uses compile-time jitless mode with Sparkplug, Maglev, TurboFan and
+WebAssembly disabled. It also disables the cppgc caged heap, avoiding its large
+aligned virtual-address reservation during startup without requiring Extended
+Virtual Addressing entitlements. Intl remains enabled. Temporal is disabled
+because the published source crate omits its Rust vendor dependencies; current
+runtime plugins do not use Temporal. These settings belong to the iOS build
+layer; the common JavaScript scheduler has no Apple-specific runtime branches.
+
+On macOS, install the source-build prerequisites with
+`brew install llvm@23 lld@23`. The helper combines Homebrew's LLVM/libclang with
+Xcode's iOS compiler runtimes in a local toolchain overlay. It downloads missing
+ICU data from the exact revision in V8's DEPS. The first build for each iOS
+architecture takes substantially longer; subsequent builds reuse
+`tools/release/work/ios-v8/<v8-version>/<rust-target>/`. Library, bindings and GN
+arguments are checked against a configuration manifest and SHA-256 hashes before
+reuse. A preparation failure stops the build instead of downloading the old
+archive. CI caches the complete artifact set and uses the same helper.
+
+For a manual build, after installing the Rust target:
+
+```bash
+python3 tools/build_scripts/prepare_ios_v8.py \
+  --target aarch64-apple-ios --env-file tools/release/work/ios-v8/device.env
+```
+
+Debug uses a regular executable with dead-code stripping and disables exporting
+all global symbols, so unused WebAssembly wrappers are removed. Swift-referenced
+Rust bridge entry points remain linked. The iSH runtime also namespaces its
+kernel printf/scanf functions so host V8 calls keep using Darwin libc. See
+`tools/ios-runtime/ish/README.md` for that native regression. Build/cache checks:
+
+```bash
+python3 -m unittest discover -s tools/tests -p test_ios_v8_build.py -v
+python3 -m unittest discover -s tools/tests -p test_apple_plugin_build.py -v
+```
+
+## Local CLI development and macOS Keychain authorization
+
+Use the local runner to build and restore the CLI's configured signing identity
+before running it:
+
+```bash
+python3 tools/build_scripts/run_cli.py -- cli character list --json
+python3 tools/build_scripts/run_cli.py --release -- cli chat list --json
+# Sign/run an existing binary without rebuilding:
+python3 tools/build_scripts/run_cli.py --no-build -- cli character list --json
+```
+
+On macOS, choose an existing real signing identity via
+`OPERIT_MACOS_SIGNING_IDENTITY`, `run_cli.py --identity`, or the Git-ignored
+`tools/build_scripts/cli_macos_signing.local` file:
+
+```json
+{"identity": "<certificate SHA-1 or certificate name>"}
+```
+
+Both the local runner and macOS CLI packaging use the fixed identifier
+`com.operit.cli`. Direct `cargo build` does not run this post-build signing step
+and can replace a trusted artifact with a new ad-hoc-signed binary. Re-run the
+local runner after such a build. Approve the new signed CLI's Keychain access
+with **Always Allow** only after checking the requesting program.
+
+The helper does not export certificates/private keys, store passwords, change
+Keychain ACLs, or disable encrypted preferences. An explicitly configured
+signing failure stops the build rather than falling back to ad-hoc signing.
+Local signing is not public-release notarization; public macOS distribution
+still needs an appropriate distribution identity and its release workflow.
+
+The role-card CLI acceptance test uses a disposable profile. Its optional AI
+fixture runs on loopback and binds every functional model (including title
+and memory generation) to that endpoint:
+
+```bash
+python3 tools/tests/character_cards_cli_smoke.py --mock-ai
+```
+
+## Local Flutter macOS signing
+
+Flutter's direct `build macos` and `run -d macos` commands can use an existing
+stable certificate through the optional, Git-ignored file
+`apps/flutter/app/macos/Runner/Configs/Signing.local.xcconfig`:
+
+```xcconfig
+CODE_SIGN_IDENTITY = <existing certificate SHA-1 or certificate name>
+OPERIT_CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM = <team ID associated with that certificate>
+```
+
+This keeps the app's own bundle identifier, sandbox and encryption entitlements.
+It does not export private keys or alter Keychain ACLs. Without this local file,
+the project's existing ad-hoc signing behavior is retained. A previously
+unauthorized certificate may still require the user to approve its first
+Keychain access; this configuration cannot bypass that permission.

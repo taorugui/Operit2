@@ -3,9 +3,9 @@
 part of '../ToolPkgUiLauncherScreen.dart';
 
 /// Renders renderer slots for Compose DSL nodes.
-extension _ComposeRendererSlots on _ComposeDslRenderer {
+extension _ComposeRendererSlots on _ComposeProgramExecutorState {
   /// Evaluates enabled for the Compose DSL renderer.
-  bool _enabled() => node.props['enabled'] != false;
+  bool _enabled() => props['enabled'] != false;
 
   /// Resolves children for the Compose DSL renderer.
   List<Widget> _children({
@@ -15,6 +15,20 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
     pathPrefix: nodePath,
     modifierScope: modifierScope,
   );
+
+  /// A native decorator must not reinterpret its child's row weight as column flex.
+  Widget _decoratorChild() =>
+      node.children.length == 1 ? _children().single : _childrenColumn();
+
+  /// Renders a single decorator slot without imposing a Row/Column flex scope.
+  Widget? _optionalSlot(String name) {
+    final nodes = node.slots[name];
+    if (nodes == null || nodes.isEmpty) return null;
+    final widgets = _buildNodeWidgets(nodes, pathPrefix: '$nodePath:$name');
+    return widgets.length == 1
+        ? widgets.single
+        : Column(mainAxisSize: MainAxisSize.min, children: widgets);
+  }
 
   /// Keeps Compose content start-aligned without forcing a cross-axis size.
   Widget _childrenColumn() => Column(
@@ -37,16 +51,17 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   Widget _slotOrText(String name) {
     final slot = node.slots[name];
     if (slot != null && slot.isNotEmpty) {
-      return _ComposeDslRenderer(
+      return _ComposeProgramExecutor(
         node: slot.first,
         onAction: onAction,
         onTextInput: onTextInput,
         webViewHostContext: webViewHostContext,
         splitMarkdownContent: splitMarkdownContent,
+        dispatchOnLoad: widget.dispatchOnLoad,
         nodePath: '$nodePath:$name/0',
       );
     }
-    final text = _string(node.props[name]);
+    final text = _string(props[name]);
     return Text(text.isEmpty ? name : text);
   }
 
@@ -78,16 +93,16 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   );
 
   /// Resolves slot nodes for the Compose DSL renderer.
-  List<_ComposeDslNode> _slotNodes(String name, {bool useChildren = false}) {
+  List<_ComposeProgramNode> _slotNodes(String name, {bool useChildren = false}) {
     final slot = node.slots[name];
     return slot != null && slot.isNotEmpty
         ? slot
-        : (useChildren ? node.children : const <_ComposeDslNode>[]);
+        : (useChildren ? node.children : const <_ComposeProgramNode>[]);
   }
 
   /// Resolves build node widgets for the Compose DSL renderer.
   List<Widget> _buildNodeWidgets(
-    List<_ComposeDslNode> nodes, {
+    List<_ComposeProgramNode> nodes, {
     required String pathPrefix,
     _ComposeDslModifierScope modifierScope = _ComposeDslModifierScope.normal,
   }) {
@@ -95,7 +110,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
         .asMap()
         .entries
         .map(
-          (entry) => _ComposeDslRenderer(
+          (entry) => _ComposeProgramExecutor(
             key: entry.value.props['key'] == null
                 ? null
                 : ValueKey(entry.value.props['key']),
@@ -104,6 +119,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
             onTextInput: onTextInput,
             webViewHostContext: webViewHostContext,
             splitMarkdownContent: splitMarkdownContent,
+            dispatchOnLoad: widget.dispatchOnLoad,
             nodePath: '$pathPrefix/${entry.key}',
             modifierScope: modifierScope,
           ),
@@ -113,7 +129,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
 
   /// Applies implicit text flex only to bounded rows without explicit weights.
   List<Widget> _buildRowChildren(
-    List<_ComposeDslNode> nodes, {
+    List<_ComposeProgramNode> nodes, {
     required String pathPrefix,
     required bool boundedWidth,
   }) {
@@ -140,7 +156,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   }
 
   /// Evaluates nodes require row flex for the Compose DSL renderer.
-  bool _nodesRequireRowFlex(List<_ComposeDslNode> nodes) {
+  bool _nodesRequireRowFlex(List<_ComposeProgramNode> nodes) {
     return nodes.any((child) => _rowFlexSpec(child.props) != null);
   }
 
@@ -231,26 +247,27 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   bool _hasSlot(String name) => (node.slots[name]?.isNotEmpty ?? false);
 
   /// Evaluates has slot from for the Compose DSL renderer.
-  bool _hasSlotFrom(_ComposeDslNode source, String name) =>
+  bool _hasSlotFrom(_ComposeProgramNode source, String name) =>
       source.slots[name]?.isNotEmpty ?? false;
 
-  Widget? _slotFrom(_ComposeDslNode source, String name) {
+  Widget? _slotFrom(_ComposeProgramNode source, String name) {
     final slot = source.slots[name];
     if (slot == null || slot.isEmpty) {
       return null;
     }
-    return _ComposeDslRenderer(
+    return _ComposeProgramExecutor(
       node: slot.first,
       onAction: onAction,
       onTextInput: onTextInput,
       webViewHostContext: webViewHostContext,
       splitMarkdownContent: splitMarkdownContent,
+      dispatchOnLoad: widget.dispatchOnLoad,
       nodePath: '$nodePath:$name/0',
     );
   }
 
   /// Resolves plain text from for the Compose DSL renderer.
-  String? _plainTextFrom(_ComposeDslNode source, String name) {
+  String? _plainTextFrom(_ComposeProgramNode source, String name) {
     final value = source.props[name];
     if (value is String && value.trim().isNotEmpty) {
       return value;
@@ -264,7 +281,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
 
   /// Resolves plain slot text for the Compose DSL renderer.
   String? _plainSlotText(String name) {
-    final value = node.props[name];
+    final value = props[name];
     if (value is String) {
       return value;
     }
@@ -285,7 +302,7 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   }
 
   /// Resolves selected index for the Compose DSL renderer.
-  int _selectedIndex(List<_ComposeDslNode> items, Object? rawIndex) {
+  int _selectedIndex(List<_ComposeProgramNode> items, Object? rawIndex) {
     final explicit = _int(rawIndex);
     if (explicit != null && explicit >= 0 && explicit < items.length) {
       return explicit;
@@ -297,13 +314,13 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
   /// Resolves image source for the Compose DSL renderer.
   String _imageSource() {
     final raw =
-        node.props['model'] ??
-        node.props['data'] ??
-        node.props['url'] ??
-        node.props['uri'] ??
-        node.props['path'] ??
-        node.props['fileUri'] ??
-        node.props['src'];
+        props['model'] ??
+        props['data'] ??
+        props['url'] ??
+        props['uri'] ??
+        props['path'] ??
+        props['fileUri'] ??
+        props['src'];
     if (raw is Map<Object?, Object?>) {
       return _string(
         raw['url'] ?? raw['uri'] ?? raw['path'] ?? raw['fileUri'] ?? raw['src'],
@@ -314,21 +331,25 @@ extension _ComposeRendererSlots on _ComposeDslRenderer {
 
   /// Builds image for the Compose DSL renderer.
   Widget _image(BuildContext context) {
-    final alpha = (_number(node.props['alpha']) ?? 1).clamp(0, 1).toDouble();
-    final fit = _boxFit(node.props['contentScale']);
-    final description = _string(node.props['contentDescription']).trim();
+    final alpha = (_number(props['alpha']) ?? 1).clamp(0, 1).toDouble();
+    final fit = _boxFit(props['contentScale']);
+    final description = _string(props['contentDescription']).trim();
     Widget child;
     final source = _imageSource().trim();
     if (source.isNotEmpty) {
-      child = Image.network(source, fit: fit);
+      child = _ComposeStableImage(
+        source: source,
+        fit: fit,
+        hostContext: webViewHostContext,
+      );
     } else {
       final iconName = _string(
-        node.props['name'] ?? node.props['icon'] ?? 'info',
+        props['name'] ?? props['icon'] ?? 'info',
       );
       child = Icon(
         _iconData(iconName),
-        color: _color(context, node.props['tint']),
-        size: _number(node.props['size']),
+        color: _color(context, props['tint']),
+        size: _number(props['size']),
       );
     }
     if (alpha < 1) {

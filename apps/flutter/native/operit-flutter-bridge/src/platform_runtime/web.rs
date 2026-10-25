@@ -33,7 +33,8 @@ pub(crate) fn startup_device_info(
             .getDeviceInfo()
             .map_err(|error| error.to_string())?
             .model,
-    })
+    pairingIncarnation: None,
+})
 }
 
 /// Resolves browser storage roots from the Web runtime storage host.
@@ -65,4 +66,9 @@ impl crate::OperitFlutterBridge {
             metadata: StartupMetadata::HostProvided,
         })
     }
+}
+
+/// Browser secrets are included by its independent browser rescue Host.
+pub(crate) fn rescue_secret_store(_root: &std::path::Path) -> Result<Option<std::sync::Arc<dyn operit_host_api::HostSecretStore>>, String> {
+    Ok(None)
 }

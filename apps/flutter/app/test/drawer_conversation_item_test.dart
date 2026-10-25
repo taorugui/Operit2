@@ -14,15 +14,16 @@ void main() {
         home: Scaffold(
           body: ConversationDrawerItem(
             history: const ChatHistoryListItem(
+              parentChatId: null,
+              group: null,
               id: 'chat-1',
               title: 'Running chat',
               updatedAt: '2026-09-02T00:00:00Z',
-              group: null,
+
               displayOrder: 0,
               workspaceId: null,
               workspaceName: null,
-              characterCardName: null,
-              characterGroupId: null,
+
               locked: false,
               pinned: false,
             ),
@@ -45,6 +46,7 @@ void main() {
             onTogglePinned: () {},
             onToggleLocked: () {},
             onDelete: () {},
+            onSwipeDelete: () {},
             onLongPress: () {},
             onMoveTo: (_) {},
             canAcceptDrop: (_) => true,
@@ -69,15 +71,16 @@ void main() {
         home: Scaffold(
           body: ConversationDrawerItem(
             history: const ChatHistoryListItem(
+              parentChatId: null,
+              group: null,
               id: 'chat-2',
               title: 'Idle chat',
               updatedAt: '2026-09-02T00:00:00Z',
-              group: null,
+
               displayOrder: 1,
               workspaceId: null,
               workspaceName: null,
-              characterCardName: null,
-              characterGroupId: null,
+
               locked: false,
               pinned: false,
             ),
@@ -100,6 +103,7 @@ void main() {
             onTogglePinned: () {},
             onToggleLocked: () {},
             onDelete: () {},
+            onSwipeDelete: () {},
             onLongPress: () {},
             onMoveTo: (_) {},
             canAcceptDrop: (_) => true,
@@ -110,6 +114,9 @@ void main() {
       ),
     );
 
-    expect(find.byKey(const ValueKey<String>('conversation-running-indicator')), findsNothing);
+    expect(
+      find.byKey(const ValueKey<String>('conversation-running-indicator')),
+      findsNothing,
+    );
   });
 }

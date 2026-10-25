@@ -1,9 +1,207 @@
 use super::*;
 
 use crate::sync::SqlChatSyncStore::tests::{openTestStore, DATABASE_MUTEX};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const CHAT_ID: &str = "chat-variants";
 const MESSAGE_TIMESTAMP: i64 = 123;
+
+/// Keeps a completed reply's totals when an older asynchronous summary refreshes the window.
+#[test]
+fn summary_context_window_update_preserves_completed_reply_totals() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("summary-context-window-totals");
+    manager
+        .updateChatTokenCounts("older".to_string(), 100, 20, 120)
+        .unwrap();
+    let snapshot = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    manager
+        .updateChatTokenCounts("older".to_string(), 160, 50, 210)
+        .unwrap();
+
+    let compacted = manager
+        .updateChatContextWindow("older".to_string(), 40)
+        .unwrap();
+
+    assert_eq!((snapshot.inputTokens, snapshot.outputTokens), (100, 20));
+    assert_eq!((compacted.inputTokens, compacted.outputTokens), (160, 50));
+    assert_eq!(compacted.currentWindowSize, 40);
+    assert_eq!(compacted.title, snapshot.title);
+    let persisted = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            persisted.inputTokens,
+            persisted.outputTokens,
+            persisted.currentWindowSize
+        ),
+        (160, 50, 40)
+    );
+    assert!(manager
+        .updateChatContextWindow("missing".to_string(), 40)
+        .is_err());
+}
+
+/// Opens a chat whose binding arrives before its workspace preference record.
+fn workspaceMetadataFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>, Workspace) {
+    crate::PreferencesDataStore::installPreferenceObserverTestHost();
+    let (paths, database, _) = openTestStore(name);
+    let workspace = Workspace {
+        id: "workspace-metadata".to_string(),
+        name: "Project".to_string(),
+        folders: vec![WorkspaceFolder {
+            name: "project".to_string(),
+            path: "/app/workspaces/project".to_string(),
+        }],
+        createdAt: 1,
+        updatedAt: 1,
+    };
+    let mut chat = ChatEntity::new(CHAT_ID.to_string(), "Workspace chat".to_string(), 1);
+    chat.workspaceId = Some(workspace.id.clone());
+    database.chatDao().insertChat(chat).unwrap();
+    let manager = ChatHistoryManager::create(paths).unwrap();
+    (manager, database, workspace)
+}
+
+/// Receives a real repository emission without triggering a chat-table refresh.
+fn receiveWorkspaceChat(receiver: &mpsc::Receiver<Vec<ChatHistory>>) -> ChatHistory {
+    let histories = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(histories.len(), 1);
+    histories.into_iter().next().unwrap()
+}
+
+/// Refreshes bound workspace names and paths when preference records arrive or change alone.
+#[test]
+fn workspace_preferences_refresh_chat_metadata_without_sql_changes() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database, mut workspace) = workspaceMetadataFixture("workspace-metadata-arrival");
+    let originalChat = database.chatDao().getChatById(CHAT_ID).unwrap().unwrap();
+    let histories = manager.chatHistoriesFlow().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let subscription = histories.subscribe(move |value| sender.send(value).unwrap());
+
+    let initial = receiveWorkspaceChat(&receiver);
+    assert_eq!(initial.workspaceId.as_deref(), Some(workspace.id.as_str()));
+    assert_eq!(initial.workspaceName, None);
+    assert_eq!(initial.workspacePrimaryPath, None);
+
+    manager.workspaceStore.upsert(workspace.clone()).unwrap();
+    let arrived = receiveWorkspaceChat(&receiver);
+    assert_eq!(arrived.workspaceName.as_deref(), Some("Project"));
+    assert_eq!(
+        arrived.workspacePrimaryPath.as_deref(),
+        Some("/app/workspaces/project")
+    );
+    assert_eq!(arrived, manager.loadChatHistories().unwrap().remove(0));
+
+    workspace.name = "Renamed project".to_string();
+    workspace.folders[0].path = "/app/workspaces/renamed".to_string();
+    workspace.updatedAt = 2;
+    manager.workspaceStore.upsert(workspace).unwrap();
+    let renamed = receiveWorkspaceChat(&receiver);
+    assert_eq!(renamed.workspaceName.as_deref(), Some("Renamed project"));
+    assert_eq!(
+        renamed.workspacePrimaryPath.as_deref(),
+        Some("/app/workspaces/renamed")
+    );
+    assert_eq!(renamed, manager.loadChatHistories().unwrap().remove(0));
+    assert_eq!(
+        database.chatDao().getChatById(CHAT_ID).unwrap().unwrap(),
+        originalChat
+    );
+    histories.unsubscribe(subscription);
+}
+
+/// Keeps an unbound chat free of workspace metadata after later workspace preference changes.
+#[test]
+fn workspace_preferences_do_not_restore_an_unbound_chat() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database, mut workspace) = workspaceMetadataFixture("workspace-metadata-unbind");
+    let histories = manager.chatHistoriesFlow().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let subscription = histories.subscribe(move |value| sender.send(value).unwrap());
+    receiveWorkspaceChat(&receiver);
+    manager.workspaceStore.upsert(workspace.clone()).unwrap();
+    receiveWorkspaceChat(&receiver);
+
+    database
+        .chatDao()
+        .updateChatWorkspaceId(CHAT_ID, None, 2)
+        .unwrap();
+    let unbound = receiveWorkspaceChat(&receiver);
+    assert_eq!(unbound.workspaceId, None);
+    assert_eq!(unbound.workspaceName, None);
+    assert_eq!(unbound.workspacePrimaryPath, None);
+    assert_eq!(manager.getWorkspaceForChat(CHAT_ID).unwrap(), None);
+
+    workspace.name = "Updated after unbind".to_string();
+    workspace.updatedAt = 3;
+    manager.workspaceStore.upsert(workspace).unwrap();
+    assert_eq!(histories.value(), vec![unbound.clone()]);
+    assert_eq!(manager.loadChatHistories().unwrap(), vec![unbound]);
+    assert_eq!(manager.getWorkspaceForChat(CHAT_ID).unwrap(), None);
+    histories.unsubscribe(subscription);
+}
+
+/// Deletes an unlocked orphaned workspace chat, its messages, selection, and binding without resolving the workspace.
+#[test]
+fn missing_workspace_chat_deletion_preserves_lock_policy_and_removes_history() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database, workspace) = workspaceMetadataFixture("workspace-metadata-delete");
+    manager.bindingStore.createLocal(CHAT_ID).unwrap();
+    manager.setCurrentChatId(CHAT_ID.to_string()).unwrap();
+    let message = ChatMessage::new_with_markdown_timestamp(
+        "user".to_string(),
+        "Orphaned conversation".to_string(),
+        MESSAGE_TIMESTAMP,
+    );
+    database
+        .messageDao()
+        .insertMessage(MessageEntity::fromChatMessage(
+            CHAT_ID.to_string(),
+            message,
+            1,
+            0,
+        ))
+        .unwrap();
+    let histories = manager.chatHistoriesFlow().unwrap();
+    assert_eq!(
+        histories.value()[0].workspaceId.as_deref(),
+        Some(workspace.id.as_str())
+    );
+    assert_eq!(histories.value()[0].workspaceName, None);
+    assert!(manager
+        .workspaceStore
+        .getById(&workspace.id)
+        .unwrap()
+        .is_none());
+
+    manager.updateChatLocked(CHAT_ID.to_string(), true).unwrap();
+    assert!(!manager.deleteChatHistory(CHAT_ID.to_string()).unwrap());
+    assert!(database.chatDao().getChatById(CHAT_ID).unwrap().is_some());
+    assert!(manager.bindingStore.contains(CHAT_ID).unwrap());
+
+    manager
+        .updateChatLocked(CHAT_ID.to_string(), false)
+        .unwrap();
+    assert!(manager.deleteChatHistory(CHAT_ID.to_string()).unwrap());
+    assert!(database.chatDao().getChatById(CHAT_ID).unwrap().is_none());
+    assert!(database
+        .messageDao()
+        .getMessagesForChat(CHAT_ID)
+        .unwrap()
+        .is_empty());
+    assert!(histories.value().is_empty());
+    assert_eq!(manager.currentChatIdFlow().unwrap(), None);
+    assert!(!manager.bindingStore.contains(CHAT_ID).unwrap());
+    assert!(manager.workspaceStore.getAll().unwrap().is_empty());
+}
 
 /// Creates one original reply and ordered variants with colliding part identities.
 fn variantFixture(name: &str, alternateCount: i32) -> Arc<AppDatabase> {
@@ -264,13 +462,16 @@ fn chatOrderFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>) {
         let mut chat = ChatEntity::new(id.to_string(), id.to_string(), 1);
         chat.displayOrder = index as i64;
         chat.pinned = id == "pinned";
-        chat.group = Some("saved-group".to_string());
-        chat.characterCardName = Some("saved-character".to_string());
+        chat.pluginExtensions.insert(
+            "fixture.owner".to_string(),
+            serde_json::json!({"opaque": id}),
+        );
         database.chatDao().insertChat(chat).unwrap();
     }
     (manager, database)
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 fn sidebarChatIds(manager: &ChatHistoryManager) -> Vec<String> {
     manager
         .chatHistoriesFlow()
@@ -281,6 +482,7 @@ fn sidebarChatIds(manager: &ChatHistoryManager) -> Vec<String> {
         .collect()
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 #[test]
 fn new_user_message_promotes_chat_below_pins_and_preserves_metadata() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
@@ -300,6 +502,7 @@ fn new_user_message_promotes_chat_below_pins_and_preserves_metadata() {
     assert_eq!(
         promoted.clone(),
         ChatEntity {
+            group: None,
             displayOrder: promoted.displayOrder,
             updatedAt: promoted.updatedAt,
             ..original
@@ -311,6 +514,7 @@ fn new_user_message_promotes_chat_below_pins_and_preserves_metadata() {
     );
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 #[test]
 fn successive_user_sends_follow_send_order_even_with_negative_display_orders() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
@@ -319,12 +523,7 @@ fn successive_user_sends_follow_send_order_even_with_negative_display_orders() {
     // still move ahead of it rather than relying solely on the wall clock.
     database
         .chatDao()
-        .updateChatOrderAndGroup(
-            "recent",
-            -9_000_000_000_000_000,
-            Some("saved-group".to_string()),
-            1,
-        )
+        .updateChatOrder("recent", -9_000_000_000_000_000)
         .unwrap();
     for (index, id) in ["older", "recent", "older"].into_iter().enumerate() {
         manager
@@ -342,6 +541,7 @@ fn successive_user_sends_follow_send_order_even_with_negative_display_orders() {
     }
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 #[test]
 fn replies_edits_and_duplicate_user_saves_do_not_promote_chat() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
@@ -396,6 +596,7 @@ fn replies_edits_and_duplicate_user_saves_do_not_promote_chat() {
     }
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 #[test]
 fn new_background_user_message_promotes_chat_through_update_path() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
@@ -427,6 +628,7 @@ fn new_background_user_message_promotes_chat_through_update_path() {
     );
 }
 
+/// Verifies canonical chat persistence using real SQLite-backed repository operations.
 #[test]
 fn user_send_in_pinned_chat_moves_it_to_front_without_unpinning() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
@@ -448,4 +650,253 @@ fn user_send_in_pinned_chat_moves_it_to_front_without_unpinning() {
             .unwrap()
             .pinned
     );
+}
+
+/// Leaves no message, part, sidebar change, or sync operation when either write stage fails.
+#[test]
+fn message_insert_and_sync_failure_leave_no_partial_message() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    for table in ["message_parts", "sync_sql_operations"] {
+        let (manager, database) = chatOrderFixture(&format!("atomic-message-insert-{table}"));
+        let chatBefore = database.chatDao().getChatById("older").unwrap();
+        let clockBefore = manager.syncClock().unwrap();
+        database.store().executeBatch(&format!(
+            "CREATE TRIGGER reject_write BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+        )).unwrap();
+        let message =
+            ChatMessage::new_with_markdown_timestamp("user".to_string(), "hello".to_string(), 100);
+        assert!(manager.addMessage("older".to_string(), message).is_err());
+        assert!(database
+            .messageDao()
+            .getMessageByTimestamp("older", 100)
+            .unwrap()
+            .is_none());
+        assert!(database
+            .messagePartDao()
+            .getPartsForChat("older")
+            .unwrap()
+            .is_empty());
+        assert_eq!(database.chatDao().getChatById("older").unwrap(), chatBefore);
+        assert_eq!(manager.syncClock().unwrap(), clockBefore);
+    }
+}
+
+/// Preserves the old metadata, contents, and clock when replacing revision parts fails.
+#[test]
+fn failed_message_update_keeps_the_complete_previous_revision() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("atomic-message-update");
+    let mut message =
+        ChatMessage::new_with_markdown_timestamp("ai".to_string(), "original".to_string(), 100);
+    message.provider = "original-provider".to_string();
+    manager
+        .addMessage("older".to_string(), message.clone())
+        .unwrap();
+    let before = manager.loadChatMessages("older").unwrap();
+    let clockBefore = manager.syncClock().unwrap();
+    database.store().executeBatch(
+        "CREATE TRIGGER reject_parts BEFORE INSERT ON message_parts BEGIN SELECT RAISE(ABORT, 'injected part failure'); END;"
+    ).unwrap();
+    message.provider = "changed-provider".to_string();
+    message.replace_with_markdown("changed".to_string());
+    assert!(manager.updateMessage("older".to_string(), message).is_err());
+    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.syncClock().unwrap(), clockBefore);
+}
+
+/// Rejects an empty revision while continuing to store a canonical empty Markdown response.
+#[test]
+fn empty_part_list_cannot_create_a_message_without_base_parts() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("atomic-empty-message");
+    let mut message =
+        ChatMessage::new_with_markdown_timestamp("ai".to_string(), String::new(), 100);
+    message.parts.clear();
+    assert!(manager.updateMessage("older".to_string(), message).is_err());
+    assert!(database
+        .messageDao()
+        .getMessageByTimestamp("older", 100)
+        .unwrap()
+        .is_none());
+    let message = ChatMessage::new_with_markdown_timestamp("ai".to_string(), String::new(), 100);
+    manager.addMessage("older".to_string(), message).unwrap();
+    let loaded = manager
+        .loadChatMessagesDesc("older".to_string(), 10, None)
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].parts.len(), 1);
+    assert_eq!(loaded[0].displayText(), "");
+}
+
+/// Keeps the base selection and variant numbering unchanged after a failed regenerated response.
+#[test]
+fn failed_variant_insert_does_not_leave_an_empty_revision() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("atomic-message-variant");
+    let message =
+        ChatMessage::new_with_markdown_timestamp("ai".to_string(), "original".to_string(), 100);
+    manager
+        .addMessage("older".to_string(), message.clone())
+        .unwrap();
+    let before = manager.loadChatMessages("older").unwrap();
+    let clockBefore = manager.syncClock().unwrap();
+    database.store().executeBatch(
+        "CREATE TRIGGER reject_variant_parts BEFORE INSERT ON message_parts WHEN NEW.variantIndex > 0 BEGIN SELECT RAISE(ABORT, 'injected variant failure'); END;"
+    ).unwrap();
+    assert!(manager
+        .addMessageVariant("older".to_string(), 100, message.clone())
+        .is_err());
+    assert!(database
+        .messageVariantDao()
+        .getVariantsForMessage("older", 100)
+        .unwrap()
+        .is_empty());
+    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.syncClock().unwrap(), clockBefore);
+    database
+        .store()
+        .executeBatch("DROP TRIGGER reject_variant_parts")
+        .unwrap();
+    assert_eq!(
+        manager
+            .addMessageVariant("older".to_string(), 100, message)
+            .unwrap(),
+        1
+    );
+}
+
+/// Preserves message metadata, every revision, and sync state when any deletion stage fails.
+#[test]
+fn failed_message_deletions_preserve_parts_and_variants() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    for mode in 0..3 {
+        let (manager, database) = chatOrderFixture(&format!("atomic-message-delete-{mode}"));
+        let message =
+            ChatMessage::new_with_markdown_timestamp("ai".to_string(), "original".to_string(), 100);
+        manager
+            .addMessage("older".to_string(), message.clone())
+            .unwrap();
+        manager
+            .addMessageVariant("older".to_string(), 100, message)
+            .unwrap();
+        let before = manager.loadChatMessages("older").unwrap();
+        let clockBefore = manager.syncClock().unwrap();
+        database.store().executeBatch(
+            "CREATE TRIGGER reject_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;"
+        ).unwrap();
+        let result = match mode {
+            0 => manager.deleteMessage("older".to_string(), 100),
+            1 => manager.deleteMessagesFrom("older".to_string(), 100),
+            2 => manager.clearChatMessages("older".to_string()),
+            _ => unreachable!(),
+        };
+        assert!(result.is_err());
+        assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+        assert_eq!(
+            database
+                .messagePartDao()
+                .getPartsForMessage("older", 100, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .messagePartDao()
+                .getPartsForMessage("older", 100, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(manager.syncClock().unwrap(), clockBefore);
+    }
+}
+
+/// Preserves page boundaries and summary context selection when loading transaction snapshots.
+#[test]
+fn message_snapshots_preserve_paging_and_summary_boundaries() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("message-snapshot-boundaries");
+    for (timestamp, sender) in [
+        (100, "user"),
+        (200, "summary"),
+        (300, "ai"),
+        (400, "summary"),
+        (500, "user"),
+    ] {
+        let message = ChatMessage::new_with_markdown_timestamp(
+            sender.to_string(),
+            timestamp.to_string(),
+            timestamp,
+        );
+        manager.addMessage("older".to_string(), message).unwrap();
+    }
+    let newest = manager
+        .loadChatMessagesDesc("older".to_string(), 2, None)
+        .unwrap();
+    assert_eq!(
+        newest
+            .iter()
+            .map(|message| message.timestamp)
+            .collect::<Vec<_>>(),
+        [500, 400]
+    );
+    let older = manager
+        .loadOlderChatMessages("older".to_string(), 400, 2)
+        .unwrap();
+    assert_eq!(
+        older
+            .iter()
+            .map(|message| message.timestamp)
+            .collect::<Vec<_>>(),
+        [200, 300]
+    );
+    let context = manager
+        .loadRuntimeChatMessages("older".to_string())
+        .unwrap();
+    assert_eq!(
+        context
+            .iter()
+            .map(|message| message.timestamp)
+            .collect::<Vec<_>>(),
+        [400, 500]
+    );
+    for (before, through, expected) in [
+        (Some(400), None, vec![300]),
+        (None, Some(300), vec![300]),
+        (Some(500), Some(300), vec![]),
+    ] {
+        let context = manager
+            .loadMessagesAfterLatestSummaryInRange("older".to_string(), before, through)
+            .unwrap();
+        assert_eq!(
+            context
+                .iter()
+                .map(|message| message.timestamp)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+/// Rejects incomplete imported records without replacing the existing chat contents or sync state.
+#[test]
+fn incomplete_import_cannot_commit_a_message_without_parts() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("atomic-incomplete-import");
+    let message =
+        ChatMessage::new_with_markdown_timestamp("ai".to_string(), "original".to_string(), 100);
+    manager
+        .addMessage("older".to_string(), message.clone())
+        .unwrap();
+    let before = manager.loadChatMessages("older").unwrap();
+    let clockBefore = manager.syncClock().unwrap();
+    let chat = database.chatDao().getChatById("older").unwrap().unwrap();
+    let message = MessageEntity::fromChatMessage("older".to_string(), message, 0, 0);
+    assert!(manager
+        .syncStore
+        .commitImportedChatRecords(chat, vec![message], Vec::new(), Vec::new())
+        .is_err());
+    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.syncClock().unwrap(), clockBefore);
 }

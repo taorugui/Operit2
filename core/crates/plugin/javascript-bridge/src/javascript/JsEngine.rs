@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -14,16 +14,16 @@ use crate::javascript::JsHostOperations;
 use crate::javascript::JsJavaBridgeDelegates::{
     javaCallInstance, javaCallStatic, javaClassExists, javaGetApplicationContext, javaNewInstance,
 };
-use crate::javascript::JsLibraries::buildRuntimeBootstrapScript;
+use crate::javascript::JsLibraries::{buildRuntimeBootstrapScript, loadBootstrapLibrary};
 use operit_host_api::HostManager::{
     defaultHostJavaScriptRuntimeHost, defaultHostRuntimeTaskSchedulerHost,
 };
 use operit_host_api::TimeUtils::currentTimeMillisU128;
 use operit_host_api::{
     HostError, HostErrorKind, HostJavaScriptAsyncJsonCallback, HostJavaScriptExecutionInterrupt,
-    HostJavaScriptInterruptHandler, HostJavaScriptJsonCallback, HostJavaScriptRuntime,
+    HostJavaScriptInterruptHandler, HostJavaScriptCallback, HostJavaScriptRuntime,
     HostJavaScriptRuntimeHost, HostJavaScriptRuntimeStateHandle, HostJavaScriptRuntimeStateOutput,
-    HostResult,
+    HostResult, HostRuntimeTaskSchedulerHost,
 };
 use operit_plugin_sdk::execution_result::{
     build_js_execution_error_payload as buildJsExecutionErrorPayload,
@@ -31,19 +31,18 @@ use operit_plugin_sdk::execution_result::{
     JsExecutionResult,
 };
 use operit_plugin_sdk::javascript::{
-    JsExecutionCompletion, JsExecutionEngine, JsExecutionFuture, JsExecutionHost,
+    JsEnvironmentOwner, JsExecutionCompletion, JsExecutionEngine, JsExecutionFuture, JsExecutionHost,
     JsToolNameResolutionRequest, JsToolPkgIpcRequest, JsToolPkgResourceRequest, JsToolPkgWasmArg,
     JsToolPkgWasmRequest, ToolPkgConfigScope, ToolPkgExecutionContext,
     ToolPkgMainRegistrationCapture, ToolPkgTextResourceHost,
 };
 use operit_plugin_sdk::toolpkg::ToolPkgApiRuntimeScript::buildToolPkgApiRuntimeScript;
-use operit_plugin_sdk::toolpkg::ToolPkgComposeDslRuntimeScript::buildComposeDslRuntimeWrappedScript;
 use operit_plugin_sdk::toolpkg::ToolPkgRegistrationBridge::buildToolPkgRegistrationBridgeScript;
-use operit_util::stream::Stream::{CollectFuture, Stream};
 use operit_util::AppLogger::AppLogger;
 
-const TAG: &str = "OperitQuickJsEngine";
-const TOOLPKG_SCRIPT_TIMEOUT_SECONDS: u64 = 60;
+const TAG: &str = "OperitJsEngine";
+/// Returns control to ready promise jobs even when a host-callback wake is lost.
+const PROMISE_JOB_PUMP_MILLIS: u64 = 200;
 type ToolPkgTextResources = BTreeMap<String, String>;
 
 #[allow(non_snake_case)]
@@ -55,13 +54,17 @@ pub trait JsExecutionListener {
 type JsExecutionListenerRef = Arc<dyn JsExecutionListener + Send + Sync>;
 
 thread_local! {
+    static CURRENT_SCRIPT_INTERRUPT: RefCell<Option<(String, HostJavaScriptExecutionInterrupt)>> = RefCell::new(None);
+    static INTERRUPTED_SCRIPT_CALL: RefCell<Option<(String, bool)>> = RefCell::new(None);
     static CURRENT_ACTIVE_CALL_CONTEXTS: RefCell<BTreeMap<String, JsCallContext>> = RefCell::new(BTreeMap::new());
     static CURRENT_EXECUTION_HOST: RefCell<Option<Arc<dyn JsExecutionHost>>> = RefCell::new(None);
     static CURRENT_REGISTRATION_CONFIG_PARAMS: RefCell<Option<BTreeMap<String, Value>>> = RefCell::new(None);
-    static CURRENT_INTERMEDIATE_CALLBACK: RefCell<Option<Arc<dyn Fn(String) + Send + Sync>>> = RefCell::new(None);
+    static CURRENT_INTERMEDIATE_CALLBACK: RefCell<Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>> = RefCell::new(None);
     static CURRENT_EXECUTION_LISTENER: RefCell<Option<JsExecutionListenerRef>> = RefCell::new(None);
+    static CURRENT_DETACHED_INTERMEDIATE_CALLBACKS: RefCell<BTreeMap<String, Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>> =
+        RefCell::new(BTreeMap::new());
     static CURRENT_ENV_OVERRIDES: RefCell<BTreeMap<String, String>> = RefCell::new(BTreeMap::new());
-    static CURRENT_CALL_RESULTS: RefCell<BTreeMap<String, String>> = RefCell::new(BTreeMap::new());
+    static CURRENT_CALL_RESULTS: RefCell<BTreeMap<String, JsExecutionResult<Value>>> = RefCell::new(BTreeMap::new());
     static CURRENT_TEXT_RESOURCE_SOURCE: RefCell<Option<JsTextResourceSource>> = RefCell::new(None);
 }
 
@@ -71,24 +74,23 @@ pub struct JsEngine {
 }
 
 #[derive(Clone)]
-#[allow(non_snake_case)]
-pub struct JsComposeDslActionEventStream {
-    engine: JsEngine,
-    actionId: String,
-    payload: Option<Value>,
-    runtimeOptions: BTreeMap<String, Value>,
-    envOverrides: BTreeMap<String, String>,
-}
-
-#[derive(Clone)]
 struct JsEngineWorker {
+    lifetimeInterrupt: HostJavaScriptExecutionInterrupt,
     runtimeHost: Arc<dyn HostJavaScriptRuntimeHost>,
     stateHandle: HostJavaScriptRuntimeStateHandle,
     alive: Arc<AtomicBool>,
     executionHost: Option<Arc<dyn JsExecutionHost>>,
+    #[cfg(test)]
+    asyncCallbackWakeEnabled: Arc<AtomicBool>,
 }
 
 enum JsAsyncCallback {
+    ProfiledToolResult {
+        requestId: u64,
+        result: Value,
+        timing: JsIpcTiming,
+        successful: bool,
+    },
     Promise {
         requestId: u64,
         result: Value,
@@ -112,18 +114,74 @@ enum JsTextResourceSource {
 
 #[derive(Clone)]
 struct JsCallContext {
+    interrupt: HostJavaScriptExecutionInterrupt,
     executionHost: Option<Arc<dyn JsExecutionHost>>,
-    intermediateCallback: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    intermediateCallback: Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>,
     executionListener: Option<JsExecutionListenerRef>,
     envOverrides: Arc<Mutex<BTreeMap<String, String>>>,
+    environmentOwner: Option<JsEnvironmentOwner>,
     textResourceSource: JsTextResourceSource,
+    ipcTiming: Option<JsIpcTiming>,
+}
+
+/// Correlates short engine steps and asynchronous tool work with their originating IPC.
+#[derive(Clone)]
+struct JsIpcTiming {
+    scheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
+    traceId: String,
+    callId: String,
+    kind: &'static str,
+    operation: String,
+    stages: Arc<Mutex<Vec<(&'static str, u64)>>>,
+}
+
+impl JsIpcTiming {
+    /// Starts one monotonic timeline without copying script or payload data.
+    fn new(traceId: String, callId: String, kind: &'static str, operation: String) -> HostResult<Self> {
+        let scheduler = defaultHostRuntimeTaskSchedulerHost();
+        let started = scheduler.monotonicTimeMillis()?;
+        Ok(Self {
+            scheduler, traceId, callId, kind, operation,
+            stages: Arc::new(Mutex::new(vec![("submitted", started)])),
+        })
+    }
+
+    /// Records one boundary with no log formatting on the measured path.
+    fn mark(&self, stage: &'static str) -> HostResult<()> {
+        let now = self.scheduler.monotonicTimeMillis()?;
+        self.stages.lock().expect("IPC timing mutex poisoned").push((stage, now));
+        Ok(())
+    }
+
+    /// Reports failures normally and successful stage timings only in an explicit performance run.
+    fn log(&self, successful: bool) {
+        if successful && std::env::var_os("OPERIT_PROFILE_COMPOSE_STAGES").is_none() {
+            return;
+        }
+        let stages = self.stages.lock().expect("IPC timing mutex poisoned");
+        let phases = stages.windows(2)
+            .map(|pair| format!("{}={}", pair[1].0, pair[1].1.saturating_sub(pair[0].1)))
+            .collect::<Vec<_>>().join(" ");
+        if successful {
+            eprintln!(
+                "event=compose_ipc_timing kind={} traceId={} callId={} operation={} wallMillis={} {}",
+                self.kind, self.traceId, self.callId, self.operation, currentTimeMillisU128(), phases,
+            );
+            return;
+        }
+        AppLogger::e("ToolPkg", &format!(
+            "event=toolpkg_ipc_{} traceId={} callId={} operation={} outcome={} {}",
+            self.kind, self.traceId, self.callId, self.operation,
+            "error", phases,
+        ));
+    }
 }
 
 struct JsPendingScriptExecution {
     callId: String,
     context: JsCallContext,
-    deadlineMillis: u128,
-    timeout: Duration,
+    deadlineMillis: Option<u128>,
+    timeout: Option<Duration>,
     completion: JsScriptCompletion,
 }
 
@@ -142,12 +200,12 @@ impl Drop for JsPendingScriptExecution {
 
 /// Owns the result sink independently from the lifetime of detached script work.
 type JsScriptCompletion =
-    Arc<Mutex<Option<tokio::sync::oneshot::Sender<JsExecutionResult<Option<String>>>>>>;
+    Arc<Mutex<Option<tokio::sync::oneshot::Sender<JsExecutionResult<Option<Value>>>>>>;
 
 /// Completes a call once without holding the result lock while waking its caller.
 fn completeScriptExecution(
     completion: &JsScriptCompletion,
-    result: JsExecutionResult<Option<String>>,
+    result: JsExecutionResult<Option<Value>>,
 ) {
     let sender = completion
         .lock()
@@ -160,20 +218,23 @@ fn completeScriptExecution(
 
 /// Owns the arguments only until a call has been started on its affine JS thread.
 struct JsScriptRequest {
+    submittedAtMs: u128,
+    executionHost: Option<Arc<dyn JsExecutionHost>>,
     callId: String,
     script: String,
     functionName: String,
     params: BTreeMap<String, Value>,
     envOverrides: BTreeMap<String, String>,
-    onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    timeout: Duration,
-    timeoutSec: u64,
+    onIntermediateResult: Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>,
+    timeout: Option<Duration>,
+    interrupt: HostJavaScriptExecutionInterrupt,
     executionListener: Option<JsExecutionListenerRef>,
     textResources: Option<Arc<ToolPkgTextResources>>,
     useComposeDslTextResources: bool,
     completion: JsScriptCompletion,
     cancelled: Arc<AtomicBool>,
-    deadlineMillis: u128,
+    deadlineMillis: Option<u128>,
+    ipcTiming: Option<JsIpcTiming>,
 }
 
 enum JsScriptRequestStep {
@@ -186,6 +247,7 @@ struct JsScriptRequestLease {
     worker: JsEngineWorker,
     callId: Option<String>,
     cancelled: Arc<AtomicBool>,
+    interrupt: HostJavaScriptExecutionInterrupt,
 }
 
 impl Drop for JsScriptRequestLease {
@@ -194,11 +256,20 @@ impl Drop for JsScriptRequestLease {
         let Some(callId) = self.callId.take() else {
             return;
         };
-        self.worker.cancelScriptRequest(callId, &self.cancelled);
+        self.worker.cancelScriptRequest(callId, &self.cancelled, &self.interrupt);
     }
 }
 
+/// Holds the immutable package identity installed when a prepared engine is claimed.
+#[derive(Clone)]
+struct JsPackageBinding {
+    executionHost: Arc<dyn JsExecutionHost>,
+    context: ToolPkgExecutionContext,
+}
+
 struct JsEngineState {
+    lifetimeInterrupt: HostJavaScriptExecutionInterrupt,
+    routeLifetime: tokio::sync::watch::Sender<()>,
     runtime: Box<dyn HostJavaScriptRuntime>,
     asyncCallbackSender: mpsc::Sender<JsAsyncCallback>,
     asyncCallbackReceiver: mpsc::Receiver<JsAsyncCallback>,
@@ -208,7 +279,12 @@ struct JsEngineState {
     composeDslTextResources: Option<Arc<ToolPkgTextResources>>,
     detachedCallContexts: BTreeMap<String, JsCallContext>,
     pendingScriptExecutions: BTreeMap<String, JsPendingScriptExecution>,
+    promiseJobPumpScheduled: Arc<AtomicBool>,
+    registeredScriptSources: BTreeMap<String, String>,
     jsEnvironmentInitialized: bool,
+    packageBinding: Arc<OnceLock<JsPackageBinding>>,
+    #[cfg(test)]
+    asyncCallbackWakeEnabled: Arc<AtomicBool>,
 }
 
 impl JsEngineWorker {
@@ -216,15 +292,30 @@ impl JsEngineWorker {
     fn new(
         executionHost: Option<Arc<dyn JsExecutionHost>>,
         toolPkgContext: Option<ToolPkgExecutionContext>,
-    ) -> Self {
+    ) -> JsExecutionResult<Self> {
+        let executionHost = match (&executionHost, &toolPkgContext) {
+            (Some(host), Some(context)) => {
+                context.validate().map_err(JsExecutionError::invalid_request)?;
+                Some(host.for_toolpkg_execution_context(context).map_err(JsExecutionError::invalid_request)?)
+            }
+            (None, Some(_)) => return Err(JsExecutionError::invalid_request("ToolPkg execution context requires a real host")),
+            (_, None) => executionHost,
+        };
         let runtimeHost = defaultHostJavaScriptRuntimeHost();
         let runtimeHostForState = runtimeHost.clone();
         let workerExecutionHost = executionHost.clone();
+        let lifetimeInterrupt = HostJavaScriptExecutionInterrupt::unlimited();
+        let stateLifetimeInterrupt = lifetimeInterrupt.clone();
         let backgroundWake = Arc::new(Mutex::new(None));
         let backgroundWakeForState = backgroundWake.clone();
+        #[cfg(test)]
+        let asyncCallbackWakeEnabled = Arc::new(AtomicBool::new(true));
+        #[cfg(test)]
+        let asyncCallbackWakeEnabledForState = asyncCallbackWakeEnabled.clone();
         let stateHandle = runtimeHost
             .createHostJavaScriptRuntimeState(
-                "OperitQuickJsEngine",
+                "OperitJsEngine",
+                operit_host_api::HostJavaScriptRuntimeStateKind::Execution,
                 Box::new(move || {
                     let runtime = runtimeHostForState.createHostJavaScriptRuntime()?;
                     let state = JsEngineState::newWithRuntime(
@@ -232,17 +323,19 @@ impl JsEngineWorker {
                         executionHost,
                         toolPkgContext,
                         backgroundWakeForState,
+                        stateLifetimeInterrupt,
+                        #[cfg(test)]
+                        asyncCallbackWakeEnabledForState,
                     )
                     .map_err(HostError::new)?;
                     Ok(Box::new(state))
                 }),
             )
-            .expect("JavaScript runtime state must be created by the Host");
+            .map_err(|error| JsExecutionError::initialization(error.to_string()))?;
         let scheduled = Arc::new(AtomicBool::new(false));
         let requested = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let wakeRuntimeHost = runtimeHost.clone();
-        let wakeScheduler = defaultHostRuntimeTaskSchedulerHost();
         let wakeSlot = backgroundWake.clone();
         let wakeAlive = alive.clone();
         let wake: JsBackgroundWake = Arc::new(move || {
@@ -254,61 +347,37 @@ impl JsEngineWorker {
                 return;
             }
             let taskRuntimeHost = wakeRuntimeHost.clone();
-            let taskScheduler = wakeScheduler.clone();
             let taskScheduled = scheduled.clone();
             let taskRequested = requested.clone();
             let taskWakeSlot = wakeSlot.clone();
             let taskAlive = wakeAlive.clone();
-            let task: operit_host_api::HostRuntimeAsyncTask = Box::new(move || {
-                Box::pin(async move {
-                    if !taskAlive.load(Ordering::Acquire) {
-                        return;
+            let task: operit_host_api::HostJavaScriptRuntimeStateTask = Box::new(move |state, interrupt| {
+                if !taskAlive.load(Ordering::Acquire) {
+                    return Ok(Box::new(()));
+                }
+                taskRequested.store(false, Ordering::Release);
+                let result = state.downcast_mut::<JsEngineState>()
+                    .ok_or_else(|| HostError::new("Invalid JavaScript runtime state"))
+                    .and_then(|state| state.advanceJavaScriptExecutions(interrupt)
+                        .map_err(|error| HostError::new(error.to_string())));
+                if let Err(error) = result {
+                    if taskAlive.load(Ordering::Acquire) {
+                        AppLogger::e(TAG, &format!("detached JavaScript execution failed: {error}"));
                     }
-                    taskRequested.store(false, Ordering::Release);
-                    let result = taskRuntimeHost
-                        .executeHostJavaScriptRuntimeStateAsyncTask(
-                            stateHandle,
-                            60_000,
-                            Box::new(move |state, interrupt| {
-                                Box::pin(async move {
-                                    let state =
-                                        state.downcast_mut::<JsEngineState>().ok_or_else(|| {
-                                            HostError::new(
-                                                "JavaScript runtime state type does not match",
-                                            )
-                                        })?;
-                                    state
-                                        .advanceJavaScriptExecutions(interrupt)
-                                        .map_err(|error| HostError::new(error.to_string()))?;
-                                    Ok(Box::new(()) as HostJavaScriptRuntimeStateOutput)
-                                })
-                            }),
-                        )
-                        .await;
-                    if let Err(error) = result {
-                        if !taskAlive.load(Ordering::Acquire) {
-                            return;
-                        }
-                        AppLogger::e(
-                            TAG,
-                            &format!("detached JavaScript execution failed: {error}"),
-                        );
+                }
+                taskScheduled.store(false, Ordering::Release);
+                if taskRequested.swap(false, Ordering::AcqRel) {
+                    if let Some(wake) = taskWakeSlot.lock()
+                        .expect("background wake mutex poisoned").clone()
+                    {
+                        wake();
                     }
-                    taskScheduled.store(false, Ordering::Release);
-                    if taskRequested.swap(false, Ordering::AcqRel) {
-                        if let Some(wake) = taskWakeSlot
-                            .lock()
-                            .expect("background wake mutex poisoned")
-                            .clone()
-                        {
-                            wake();
-                        }
-                    }
-                })
+                }
+                Ok(Box::new(()))
             });
-            if let Err(error) =
-                taskScheduler.scheduleHostRuntimeCooperativeAsyncTask("operit-js-detached", task)
-            {
+            if let Err(error) = taskRuntimeHost.enqueueHostJavaScriptRuntimeStateTask(
+                stateHandle, HostJavaScriptExecutionInterrupt::unlimited(), task,
+            ) {
                 scheduled.store(false, Ordering::Release);
                 AppLogger::e(
                     TAG,
@@ -319,17 +388,21 @@ impl JsEngineWorker {
         *backgroundWake
             .lock()
             .expect("background wake mutex poisoned") = Some(wake);
-        Self {
+        Ok(Self {
+            lifetimeInterrupt,
             runtimeHost,
             stateHandle,
             alive,
             executionHost: workerExecutionHost,
-        }
+            #[cfg(test)]
+            asyncCallbackWakeEnabled,
+        })
     }
 
     /// Cancels a submitted call independently of whether its completion future is polled.
     #[allow(non_snake_case)]
-    fn cancelScriptRequest(&self, callId: String, cancelled: &AtomicBool) {
+    fn cancelScriptRequest(&self, callId: String, cancelled: &AtomicBool, interrupt: &HostJavaScriptExecutionInterrupt) {
+        interrupt.interrupt();
         cancelled.store(true, Ordering::Release);
         let worker = self.clone();
         let result = defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeAsyncTask(
@@ -338,7 +411,7 @@ impl JsEngineWorker {
                 Box::pin(async move {
                     if worker.alive.load(Ordering::Acquire) {
                         let _ = worker
-                            .executeScriptStepAsync(JsScriptRequestStep::Cancel(callId), 60_000, 60)
+                            .executeScriptStepAsync(JsScriptRequestStep::Cancel(callId))
                             .await;
                     }
                 })
@@ -357,15 +430,13 @@ impl JsEngineWorker {
     async fn executeScriptStepAsync(
         &self,
         step: JsScriptRequestStep,
-        timeoutMillis: u64,
-        timeoutSec: u64,
     ) -> JsExecutionResult<()> {
-        let task = scriptRequestStepTask(step, timeoutSec);
+        let task = scriptRequestStepTask(step);
         let output = self
             .runtimeHost
             .executeHostJavaScriptRuntimeStateAsyncTask(
                 self.stateHandle,
-                timeoutMillis,
+                HostJavaScriptExecutionInterrupt::unlimited(),
                 Box::new(move |state, interrupt| Box::pin(async move { task(state, interrupt) })),
             )
             .await
@@ -381,14 +452,14 @@ impl JsEngineWorker {
         functionName: String,
         params: BTreeMap<String, Value>,
         envOverrides: BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        on_intermediate_result: Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>,
         _dispatchIntermediateOnMain: bool,
-        timeout: Duration,
-        timeoutSec: u64,
+        timeout: Option<Duration>,
         executionListener: Option<JsExecutionListenerRef>,
         textResources: Option<Arc<ToolPkgTextResources>>,
         useComposeDslTextResources: bool,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+    ) -> JsExecutionCompletion<JsExecutionResult<Option<Value>>> {
+        let executionHost = self.executionHost.as_ref().map(|host| host.capture_tool_invocation_host());
         let worker = self.clone();
         Box::pin(async move {
             if !worker.alive.load(Ordering::Acquire) {
@@ -396,8 +467,17 @@ impl JsEngineWorker {
                     "JavaScript runtime was destroyed",
                 ));
             }
-            let deadlineMillis = scriptRequestDeadline(timeout)?;
+            let deadlineMillis = timeout.map(scriptRequestDeadline).transpose()?;
+            let interrupt = match timeout {
+                Some(duration) => HostJavaScriptExecutionInterrupt::new(
+                    u64::try_from(duration.as_millis()).map_err(|_| JsExecutionError::invalid_request("Before hook timeout exceeds the host range"))?,
+                ).map_err(javaScriptExecutionErrorFromHost)?,
+                None => HostJavaScriptExecutionInterrupt::unlimited(),
+            };
             let callId = format!("operit_call_{}", Uuid::new_v4().simple());
+            let ipcTiming = params.get("__operit_ipc_trace_id").and_then(Value::as_str)
+                .map(|traceId| JsIpcTiming::new(traceId.to_string(), callId.clone(), "execution", functionName.clone()))
+                .transpose().map_err(javaScriptExecutionErrorFromHost)?;
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let completion = Arc::new(Mutex::new(Some(sender)));
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -405,8 +485,11 @@ impl JsEngineWorker {
                 worker: worker.clone(),
                 callId: Some(callId.clone()),
                 cancelled: cancelled.clone(),
+                interrupt: interrupt.clone(),
             };
             let request = JsScriptRequest {
+                submittedAtMs: currentTimeMillisU128(),
+                executionHost,
                 callId,
                 script,
                 functionName,
@@ -414,72 +497,77 @@ impl JsEngineWorker {
                 envOverrides,
                 onIntermediateResult: on_intermediate_result,
                 timeout,
-                timeoutSec,
+                interrupt: interrupt.clone(),
                 executionListener,
                 textResources,
                 useComposeDslTextResources,
                 completion: completion.clone(),
                 cancelled: cancelled.clone(),
                 deadlineMillis,
+                ipcTiming: ipcTiming.clone(),
             };
-            // A deadline is one Host event, not a recurring polling interval.
-            let weakCompletion = Arc::downgrade(&completion);
-            let deadlineWorker = worker.clone();
-            let deadlineCallId = request.callId.clone();
-            defaultHostRuntimeTaskSchedulerHost()
-                .scheduleDelayedHostRuntimeTask(
-                    "operit-js-deadline",
-                    remainingScriptRequestMillis(deadlineMillis, timeoutSec)?,
-                    Box::new(move || {
-                        if let Some(completion) = weakCompletion.upgrade() {
-                            let sender = completion
-                                .lock()
-                                .expect("JavaScript completion mutex poisoned")
-                                .take();
-                            if let Some(sender) = sender {
-                                deadlineWorker.cancelScriptRequest(deadlineCallId, &cancelled);
-                                let _ = sender.send(Err(JsExecutionError::timeout(format!(
-                                    "Script execution timed out after {} milliseconds",
-                                    timeout.as_millis(),
-                                ))));
-                            }
-                        }
-                    }),
-                )
-                .map_err(javaScriptExecutionErrorFromHost)?;
-            let completionForStart = completion.clone();
-            defaultHostRuntimeTaskSchedulerHost()
-                .scheduleHostRuntimeAsyncTask(
-                    "operit-js-request",
-                    Box::new(move || {
-                        Box::pin(async move {
-                            let result = async {
-                                if !worker.alive.load(Ordering::Acquire) {
-                                    return Err(JsExecutionError::worker_unavailable(
-                                        "JavaScript runtime was destroyed",
-                                    ));
+            // Only finite requests schedule a wall-clock completion deadline.
+            if let Some(deadlineMillis) = deadlineMillis {
+                let weakCompletion = Arc::downgrade(&completion);
+                let deadlineWorker = worker.clone();
+                let deadlineCallId = request.callId.clone();
+                let deadlineInterrupt = interrupt.clone();
+                defaultHostRuntimeTaskSchedulerHost()
+                    .scheduleDelayedHostRuntimeTask(
+                        "operit-js-deadline",
+                        remainingScriptRequestMillis(deadlineMillis)?,
+                        Box::new(move || {
+                            if let Some(completion) = weakCompletion.upgrade() {
+                                let sender = completion
+                                    .lock()
+                                    .expect("JavaScript completion mutex poisoned")
+                                    .take();
+                                if let Some(sender) = sender {
+                                    deadlineWorker.cancelScriptRequest(deadlineCallId, &cancelled, &deadlineInterrupt);
+                                    let _ = sender.send(Err(JsExecutionError::timeout(format!(
+                                        "Script execution timed out after {} milliseconds",
+                                        timeout.expect("Timed before hook must own a duration").as_millis(),
+                                    ))));
                                 }
-                                worker
-                                    .executeScriptStepAsync(
-                                        JsScriptRequestStep::Start(request),
-                                        remainingScriptRequestMillis(deadlineMillis, timeoutSec)?,
-                                        timeoutSec,
-                                    )
-                                    .await
                             }
-                            .await;
-                            if let Err(error) = result {
-                                completeScriptExecution(&completionForStart, Err(error));
-                            }
-                        })
-                    }),
-                )
-                .map_err(javaScriptExecutionErrorFromHost)?;
+                        }),
+                    )
+                    .map_err(javaScriptExecutionErrorFromHost)?;
+            }
+            let completionForStart = completion.clone();
+            let timingForStart = request.ipcTiming.clone();
+            let aliveForStart = worker.alive.clone();
+            let task = scriptRequestStepTask(JsScriptRequestStep::Start(request));
+            worker.runtimeHost.enqueueHostJavaScriptRuntimeStateTask(
+                worker.stateHandle, interrupt,
+                Box::new(move |state, interrupt| {
+                    let result = (|| {
+                        if let Some(timing) = &timingForStart {
+                            timing.mark("schedulerWaitMs").map_err(javaScriptExecutionErrorFromHost)?;
+                        }
+                        if !aliveForStart.load(Ordering::Acquire) {
+                            return Err(JsExecutionError::worker_unavailable("JavaScript runtime was destroyed"));
+                        }
+                        let output = task(state, interrupt).map_err(javaScriptExecutionErrorFromHost)?;
+                        downcastJavaScriptStateOutput::<()>(output)
+                    })();
+                    if let Err(error) = result {
+                        completeScriptExecution(&completionForStart, Err(error));
+                    }
+                    Ok(Box::new(()))
+                }),
+            ).map_err(javaScriptExecutionErrorFromHost)?;
+            // The queued task owns completion; dropping an unstarted task must disconnect its caller.
+            drop(completion);
             let result = receiver.await.map_err(|_| {
                 JsExecutionError::worker_unavailable(
                     "JavaScript execution completion channel disconnected",
                 )
             })?;
+            if let Some(timing) = ipcTiming {
+                timing.mark("resultReturnMs").map_err(javaScriptExecutionErrorFromHost)?;
+                timing.log(result.is_ok());
+            }
             if result.is_ok() {
                 lease.callId = None;
             }
@@ -495,13 +583,10 @@ impl JsEngineWorker {
         functionName: &str,
         params: &BTreeMap<String, Value>,
         textResources: Option<Arc<ToolPkgTextResources>>,
-        timeoutSec: u64,
     ) -> JsExecutionResult<ToolPkgMainRegistrationCapture> {
         let result = self.runtimeHost.executeHostJavaScriptRuntimeStateTask(
             self.stateHandle,
-            timeoutSec
-                .checked_mul(1_000)
-                .expect("ToolPkg registration timeout must fit in milliseconds"),
+            HostJavaScriptExecutionInterrupt::unlimited(),
             Box::new({
                 let script = script.to_string();
                 let functionName = functionName.to_string();
@@ -513,7 +598,6 @@ impl JsEngineWorker {
                     let output = executeWithInterrupt(
                         state,
                         interrupt,
-                        timeoutSec,
                         "ToolPkg registration",
                         |state| {
                             state.execute_toolpkg_main_registration_function_on_current_thread(
@@ -536,6 +620,7 @@ impl JsEngineWorker {
 
     /// Destroys the host-owned JavaScript runtime state.
     fn destroy(&self) {
+        self.lifetimeInterrupt.interrupt();
         if !self.alive.swap(false, Ordering::AcqRel) {
             return;
         }
@@ -545,11 +630,10 @@ impl JsEngineWorker {
     }
 }
 
-/// Builds an interrupt-bounded phase; no borrow of the state escapes this operation.
+/// Builds one cancellable state step without retaining its borrow across an await.
 #[allow(non_snake_case)]
 fn scriptRequestStepTask(
     step: JsScriptRequestStep,
-    timeoutSec: u64,
 ) -> operit_host_api::HostJavaScriptRuntimeStateTask {
     Box::new(move |state, interrupt| {
         let state = state
@@ -557,7 +641,7 @@ fn scriptRequestStepTask(
             .ok_or_else(|| HostError::new("JavaScript runtime state type does not match"))?;
         let stepInterrupt = interrupt.clone();
         let output =
-            executeWithInterrupt(state, interrupt, timeoutSec, "Script execution", |state| {
+            executeWithInterrupt(state, interrupt, "Before hook execution", |state| {
                 state.executeScriptRequestStep(step, stepInterrupt)
             });
         clearThreadLocalCallState();
@@ -575,11 +659,11 @@ fn scriptRequestDeadline(timeout: Duration) -> JsExecutionResult<u128> {
 }
 
 #[allow(non_snake_case)]
-fn remainingScriptRequestMillis(deadline: u128, timeoutSec: u64) -> JsExecutionResult<u64> {
+fn remainingScriptRequestMillis(deadline: u128) -> JsExecutionResult<u64> {
     let remaining = deadline.saturating_sub(currentTimeMillisU128());
     if remaining == 0 {
         return Err(JsExecutionError::timeout(format!(
-            "Script execution timed out after {timeoutSec} seconds"
+            "Before hook timed out before execution"
         )));
     }
     u64::try_from(remaining).map_err(|_| {
@@ -606,18 +690,36 @@ fn downcastJavaScriptStateOutput<T: 'static>(
     *output
 }
 
+/// Checks only the currently executing call, leaving suspended owners unaffected.
+fn activeScriptShouldInterrupt() -> bool {
+    CURRENT_SCRIPT_INTERRUPT.with(|current| {
+        let current = current.borrow();
+        let Some((callId, interrupt)) = current.as_ref() else { return false; };
+        if !interrupt.shouldInterrupt() { return false; }
+        INTERRUPTED_SCRIPT_CALL.with(|call| *call.borrow_mut() = Some((callId.clone(), interrupt.didTimeOut())));
+        true
+    })
+}
+
+/// Keeps rejected native awaits interruptible after their JavaScript session has been retired.
+fn activateCancelledScriptCall(callId: String) {
+    let interrupt = HostJavaScriptExecutionInterrupt::unlimited();
+    interrupt.interrupt();
+    CURRENT_SCRIPT_INTERRUPT.with(|current| *current.borrow_mut() = Some((callId, interrupt)));
+}
+
 /// Executes one JavaScript operation under a host-owned interrupt token.
 #[allow(non_snake_case)]
 fn executeWithInterrupt<T>(
     state: &mut JsEngineState,
     interrupt: HostJavaScriptExecutionInterrupt,
-    timeoutSec: u64,
     timeoutLabel: &str,
     operation: impl FnOnce(&mut JsEngineState) -> JsExecutionResult<T>,
 ) -> JsExecutionResult<T> {
     let interruptForHandler = interrupt.clone();
+    let lifetimeInterrupt = state.lifetimeInterrupt.clone();
     let handler: HostJavaScriptInterruptHandler =
-        Arc::new(move || interruptForHandler.shouldInterrupt());
+        Arc::new(move || interruptForHandler.shouldInterrupt() || lifetimeInterrupt.shouldInterrupt());
     if let Err(error) = state
         .runtime
         .setHostJavaScriptInterruptHandler(Some(handler))
@@ -631,174 +733,175 @@ fn executeWithInterrupt<T>(
     }
     if interrupt.didTimeOut() {
         return Err(JsExecutionError::timeout(format!(
-            "{timeoutLabel} timed out after {timeoutSec} seconds"
+            "{timeoutLabel} timed out"
         )));
     }
     output
 }
 
+/// Owns a pristine initialized engine until binding succeeds or its request is cancelled.
+pub(crate) struct PreparedJsEngine {
+    engine: Option<JsEngine>,
+}
+
+impl PreparedJsEngine {
+    /// Initializes only the shared runtime, native interfaces and SDK bootstrap.
+    pub(crate) fn new() -> Result<Self, String> {
+        let worker = JsEngineWorker::new(None, None).map_err(|error| error.to_string())?;
+        Ok(Self {
+            engine: Some(JsEngine { worker }),
+        })
+    }
+
+    /// Authenticates and binds one package exactly once on the runtime's Host executor.
+    pub(crate) async fn bind(
+        mut self,
+        executionHost: Arc<dyn JsExecutionHost>,
+        context: ToolPkgExecutionContext,
+    ) -> Result<JsEngine, String> {
+        context.validate()?;
+        let host = executionHost.for_toolpkg_execution_context(&context)?;
+        let engine = self
+            .engine
+            .as_mut()
+            .expect("Prepared engine must be owned until binding completes");
+        let boundHost = host.clone();
+        engine
+            .worker
+            .runtimeHost
+            .executeHostJavaScriptRuntimeStateAsyncTask(
+                engine.worker.stateHandle,
+                HostJavaScriptExecutionInterrupt::unlimited(),
+                Box::new(move |state, _interrupt| {
+                    Box::pin(async move {
+                        let state = state.downcast_mut::<JsEngineState>().ok_or_else(|| {
+                            HostError::new("JavaScript runtime state type does not match")
+                        })?;
+                        if state.executionHost.is_some() || state.toolPkgContext.is_some() {
+                            return Err(HostError::new(
+                                "Prepared engine already has an execution owner",
+                            ));
+                        }
+                        state
+                            .packageBinding
+                            .set(JsPackageBinding {
+                                executionHost: boundHost.clone(),
+                                context: context.clone(),
+                            })
+                            .map_err(|_| {
+                                HostError::new("ToolPkg execution context is already bound")
+                            })?;
+                        state.executionHost = Some(boundHost);
+                        state.toolPkgContext = Some(context);
+                        Ok(Box::new(()) as HostJavaScriptRuntimeStateOutput)
+                    })
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        engine.worker.executionHost = Some(host);
+        Ok(self
+            .engine
+            .take()
+            .expect("Bound engine must still be owned"))
+    }
+}
+
+impl Drop for PreparedJsEngine {
+    /// Destroys unused, rejected or cancelled prepared engines through their Host.
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.take() {
+            engine.worker.destroy();
+        }
+    }
+}
+
 impl JsEngine {
     /// Creates a JavaScript execution engine backed by a caller-supplied execution host.
-    pub fn new(executionHost: Arc<dyn JsExecutionHost>) -> Self {
-        Self {
-            worker: JsEngineWorker::new(Some(executionHost), None),
-        }
+    pub fn new(executionHost: Arc<dyn JsExecutionHost>) -> JsExecutionResult<Self> {
+        Ok(Self {
+            worker: JsEngineWorker::new(Some(executionHost), None)?,
+        })
     }
 
     /// Creates a JavaScript execution engine bound to one ToolPkg package environment.
     pub fn new_toolpkg_execution_engine(
         executionHost: Arc<dyn JsExecutionHost>,
         context: ToolPkgExecutionContext,
-    ) -> Self {
-        Self {
-            worker: JsEngineWorker::new(Some(executionHost), Some(context)),
-        }
+    ) -> JsExecutionResult<Self> {
+        Ok(Self {
+            worker: JsEngineWorker::new(Some(executionHost), Some(context))?,
+        })
     }
 
     /// Creates a JavaScript engine used only for ToolPkg registration.
     #[allow(non_snake_case)]
-    pub fn new_toolpkg_registration_engine() -> Self {
-        Self {
-            worker: JsEngineWorker::new(None, None),
-        }
+    pub fn new_toolpkg_registration_engine() -> JsExecutionResult<Self> {
+        Ok(Self {
+            worker: JsEngineWorker::new(None, None)?,
+        })
     }
 
-    /// Executes a named JavaScript function with serialized parameters.
+    /// Executes a script until completion or explicit caller cancellation.
     #[allow(non_snake_case)]
     pub fn execute_script_function(
-        &self,
-        script: &str,
-        functionName: &str,
-        params: &BTreeMap<String, Value>,
+        &self, script: &str, functionName: &str, params: &BTreeMap<String, Value>,
         envOverrides: &BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatchIntermediateOnMain: bool,
-        timeoutSec: u64,
         executionListener: Option<JsExecutionListenerRef>,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        if timeoutSec == 0 {
-            let reason = "Script execution timed out after 0 seconds";
-            if let Some(listener) = executionListener.as_ref() {
-                listener.on_failed("", reason);
-            }
-            return Box::pin(async move { Err(JsExecutionError::timeout(reason)) });
-        }
-        self.execute_script_function_with_timeout(
-            script,
-            functionName,
-            params,
-            envOverrides,
-            on_intermediate_result,
-            dispatchIntermediateOnMain,
-            Duration::from_secs(timeoutSec),
-            timeoutSec,
-            executionListener,
-            None,
-            false,
-        )
+        self.executeScriptFunction(script, functionName, params, envOverrides,
+            on_intermediate_result, dispatchIntermediateOnMain, None, executionListener)
     }
 
-    /// Executes a named JavaScript function with an exact millisecond deadline.
+    /// Applies the caller's explicit before-hook completion deadline.
     #[allow(non_snake_case)]
     pub fn execute_script_function_with_timeout_millis(
-        &self,
-        script: &str,
-        functionName: &str,
-        params: &BTreeMap<String, Value>,
+        &self, script: &str, functionName: &str, params: &BTreeMap<String, Value>,
         envOverrides: &BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        dispatchIntermediateOnMain: bool,
-        timeoutMillis: u64,
+        dispatchIntermediateOnMain: bool, timeoutMillis: u64,
         executionListener: Option<JsExecutionListenerRef>,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
         if timeoutMillis == 0 {
-            let reason = "Script execution timed out after 0 milliseconds";
-            if let Some(listener) = executionListener.as_ref() {
-                listener.on_failed("", reason);
-            }
-            return Box::pin(async move { Err(JsExecutionError::timeout(reason)) });
+            return Box::pin(async { Err(JsExecutionError::timeout("Before hook timed out before execution")) });
         }
-        let timeoutSec = (timeoutMillis - 1) / 1_000 + 1;
-        self.execute_script_function_with_timeout(
-            script,
-            functionName,
-            params,
-            envOverrides,
-            on_intermediate_result,
-            dispatchIntermediateOnMain,
-            Duration::from_millis(timeoutMillis),
-            timeoutSec,
-            executionListener,
-            None,
-            false,
-        )
+        self.executeScriptFunction(script, functionName, params, envOverrides,
+            on_intermediate_result, dispatchIntermediateOnMain,
+            Some(Duration::from_millis(timeoutMillis)), executionListener)
     }
 
-    /// Executes a named JavaScript function while allowing the host runtime to keep advancing.
+    /// Executes asynchronous script work without counting suspended Promise time.
     #[allow(non_snake_case)]
     pub fn execute_script_function_async(
-        &self,
-        script: String,
-        functionName: String,
-        params: BTreeMap<String, Value>,
+        &self, script: String, functionName: String, params: BTreeMap<String, Value>,
         envOverrides: BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatchIntermediateOnMain: bool,
-        timeoutMillis: u64,
         executionListener: Option<JsExecutionListenerRef>,
     ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        if timeoutMillis == 0 {
-            let reason = "Script execution timed out after 0 milliseconds";
-            if let Some(listener) = executionListener.as_ref() {
-                listener.on_failed("", reason);
-            }
-            return Box::pin(async move { Err(JsExecutionError::timeout(reason)) });
-        }
-        let timeoutSec = (timeoutMillis - 1) / 1_000 + 1;
-        self.worker.execute_script_function_async(
-            script,
-            functionName,
-            params,
-            envOverrides,
-            on_intermediate_result,
-            dispatchIntermediateOnMain,
-            Duration::from_millis(timeoutMillis),
-            timeoutSec,
-            executionListener,
-            None,
-            false,
-        )
+        textScriptCompletion(self.worker.execute_script_function_async(
+            script, functionName, params, envOverrides,
+            textIntermediateCallback(on_intermediate_result), dispatchIntermediateOnMain,
+            None, executionListener, None, false,
+        ))
     }
 
-    /// Executes JavaScript with the supplied native deadline and whole-second script metadata.
+    /// Shares lifecycle and cancellation handling between ordinary scripts and before hooks.
     #[allow(non_snake_case)]
-    fn execute_script_function_with_timeout(
-        &self,
-        script: &str,
-        functionName: &str,
-        params: &BTreeMap<String, Value>,
+    fn executeScriptFunction(
+        &self, script: &str, functionName: &str, params: &BTreeMap<String, Value>,
         envOverrides: &BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        dispatchIntermediateOnMain: bool,
-        timeout: Duration,
-        timeoutSec: u64,
+        dispatchIntermediateOnMain: bool, timeout: Option<Duration>,
         executionListener: Option<JsExecutionListenerRef>,
-        textResources: Option<Arc<ToolPkgTextResources>>,
-        useComposeDslTextResources: bool,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        self.worker.execute_script_function_async(
-            script.to_owned(),
-            functionName.to_owned(),
-            params.clone(),
-            envOverrides.clone(),
-            on_intermediate_result,
-            dispatchIntermediateOnMain,
-            timeout,
-            timeoutSec,
-            executionListener,
-            textResources,
-            useComposeDslTextResources,
-        )
+        textScriptCompletion(self.worker.execute_script_function_async(
+            script.to_owned(), functionName.to_owned(), params.clone(), envOverrides.clone(),
+            textIntermediateCallback(on_intermediate_result), dispatchIntermediateOnMain,
+            timeout, executionListener, None, false,
+        ))
     }
 
     /// Executes a ToolPkg registration function and captures its declaration.
@@ -817,7 +920,7 @@ impl JsEngine {
         )
     }
 
-    /// Executes ToolPkg registration with archive text resources and the standard deadline.
+    /// Executes ToolPkg registration with archive text resources until completion.
     #[allow(non_snake_case)]
     pub(crate) fn execute_toolpkg_main_registration_function_with_text_resources(
         &self,
@@ -826,122 +929,24 @@ impl JsEngine {
         params: &BTreeMap<String, Value>,
         textResources: Option<Arc<ToolPkgTextResources>>,
     ) -> JsExecutionResult<ToolPkgMainRegistrationCapture> {
-        self.executeToolPkgMainRegistrationWithTimeout(
-            script,
-            functionName,
-            params,
-            textResources,
-            TOOLPKG_SCRIPT_TIMEOUT_SECONDS,
-        )
-    }
-
-    /// Executes ToolPkg registration with one explicit native deadline.
-    #[allow(non_snake_case)]
-    fn executeToolPkgMainRegistrationWithTimeout(
-        &self,
-        script: &str,
-        functionName: &str,
-        params: &BTreeMap<String, Value>,
-        textResources: Option<Arc<ToolPkgTextResources>>,
-        timeoutSec: u64,
-    ) -> JsExecutionResult<ToolPkgMainRegistrationCapture> {
-        if timeoutSec == 0 {
-            return Err(JsExecutionError::timeout(
-                "ToolPkg registration timed out after 0 seconds",
-            ));
-        }
         self.worker.execute_toolpkg_main_registration_function(
             script,
             functionName,
             params,
             textResources,
-            timeoutSec,
-        )
-    }
-
-    /// Executes a Compose DSL script and returns its rendered event stream.
-    #[allow(non_snake_case)]
-    pub fn execute_compose_dsl_script(
-        &self,
-        script: &str,
-        runtimeOptions: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-        textResources: Arc<ToolPkgTextResources>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        self.executeComposeDslFunction(
-            &buildComposeDslRuntimeWrappedScript(script),
-            "__operit_render_compose_dsl",
-            runtimeOptions,
-            envOverrides,
-            None,
-            Some(textResources),
-        )
-    }
-
-    /// Executes a Compose DSL render while allowing the host runtime to keep advancing.
-    #[allow(non_snake_case)]
-    pub fn execute_compose_dsl_script_async(
-        &self,
-        script: String,
-        runtimeOptions: BTreeMap<String, Value>,
-        envOverrides: BTreeMap<String, String>,
-        textResources: Arc<ToolPkgTextResources>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        self.executeComposeDslFunctionAsync(
-            buildComposeDslRuntimeWrappedScript(&script),
-            "__operit_render_compose_dsl".to_string(),
-            runtimeOptions,
-            envOverrides,
-            None,
-            Some(textResources),
-        )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn execute_compose_dsl_action(
-        &self,
-        actionId: &str,
-        payload: Option<Value>,
-        runtimeOptions: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        let normalizedActionId = actionId.trim();
-        if normalizedActionId.is_empty() {
-            return Box::pin(async {
-                Err(JsExecutionError::invalid_request(
-                    "compose action id is required",
-                ))
-            });
-        }
-        let mut params = runtimeOptions.clone();
-        params.insert(
-            "__action_id".to_string(),
-            Value::String(normalizedActionId.to_string()),
-        );
-        if let Some(payload) = payload {
-            params.insert("__action_payload".to_string(), payload);
-        }
-        self.executeComposeDslFunction(
-            "",
-            "__operit_dispatch_compose_dsl_action",
-            &params,
-            envOverrides,
-            on_intermediate_result,
-            None,
         )
     }
 
     /// Dispatches a Compose DSL action while allowing the host runtime to keep advancing.
     #[allow(non_snake_case)]
-    pub fn dispatch_compose_dsl_action_result_async(
+    pub fn dispatch_compose_dsl_action_stream_async(
         &self,
         actionId: String,
         payload: Option<Value>,
         runtimeOptions: BTreeMap<String, Value>,
         envOverrides: BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
+        on_response: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
         let normalizedActionId = actionId.trim().to_string();
         if normalizedActionId.is_empty() {
             return Box::pin(async {
@@ -960,50 +965,23 @@ impl JsEngine {
             "__operit_dispatch_compose_dsl_action".to_string(),
             params,
             envOverrides,
-            on_intermediate_result,
+            Some(on_response),
             None,
         )
     }
 
-    #[allow(non_snake_case)]
-    pub fn rerender_compose_dsl_tree(
+    /// Sends render commits on the JS thread before asynchronous command completion can be overtaken.
+    pub fn execute_compose_dsl_script_stream_async(
         &self,
-        runtimeOptions: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        self.executeComposeDslFunction(
-            "",
-            "__operit_rerender_compose_dsl",
-            runtimeOptions,
-            envOverrides,
-            None,
-            None,
-        )
-    }
-
-    /// Executes a Compose DSL operation with the resource snapshot owned by its page runtime.
-    #[allow(non_snake_case)]
-    fn executeComposeDslFunction(
-        &self,
-        script: &str,
-        functionName: &str,
-        params: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-        onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
-        textResources: Option<Arc<ToolPkgTextResources>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        self.execute_script_function_with_timeout(
-            script,
-            functionName,
-            params,
-            envOverrides,
-            onIntermediateResult,
-            true,
-            Duration::from_secs(TOOLPKG_SCRIPT_TIMEOUT_SECONDS),
-            TOOLPKG_SCRIPT_TIMEOUT_SECONDS,
-            None,
-            textResources,
-            true,
+        script: String,
+        runtimeOptions: BTreeMap<String, Value>,
+        envOverrides: BTreeMap<String, String>,
+        textResources: Arc<ToolPkgTextResources>,
+        onResponse: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+        self.executeComposeDslFunctionAsync(
+            script, "__operit_render_compose_dsl".into(),
+            runtimeOptions, envOverrides, Some(onResponse), Some(textResources),
         )
     }
 
@@ -1015,9 +993,9 @@ impl JsEngine {
         functionName: String,
         params: BTreeMap<String, Value>,
         envOverrides: BTreeMap<String, String>,
-        onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        onIntermediateResult: Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>>,
         textResources: Option<Arc<ToolPkgTextResources>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
         self.worker.execute_script_function_async(
             script,
             functionName,
@@ -1025,102 +1003,21 @@ impl JsEngine {
             envOverrides,
             onIntermediateResult,
             true,
-            Duration::from_secs(TOOLPKG_SCRIPT_TIMEOUT_SECONDS),
-            TOOLPKG_SCRIPT_TIMEOUT_SECONDS,
+            None,
             None,
             textResources,
             true,
         )
     }
 
-    #[allow(non_snake_case)]
-    pub fn dispatch_compose_dsl_action_async(
-        &self,
-        actionId: &str,
-        payload: Option<Value>,
-        runtimeOptions: BTreeMap<String, Value>,
-        envOverrides: BTreeMap<String, String>,
-    ) -> JsComposeDslActionEventStream {
-        JsComposeDslActionEventStream {
-            engine: self.clone(),
-            actionId: actionId.to_string(),
-            payload,
-            runtimeOptions,
-            envOverrides,
-        }
-    }
 }
 
-impl Stream for JsComposeDslActionEventStream {
-    type Item = String;
-
-    /// Collects Compose DSL action events without blocking the collector task.
-    fn collect<'a>(&'a mut self, collector: &'a mut dyn FnMut(Self::Item)) -> CollectFuture<'a> {
-        Box::pin(async move {
-            let intermediateEvents = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let intermediateEventsForCallback = intermediateEvents.clone();
-            let result = self
-                .engine
-                .dispatch_compose_dsl_action_result_async(
-                    self.actionId.clone(),
-                    self.payload.clone(),
-                    self.runtimeOptions.clone(),
-                    self.envOverrides.clone(),
-                    Some(Arc::new(move |intermediate| {
-                        intermediateEventsForCallback
-                            .lock()
-                            .expect("compose dsl intermediate event mutex poisoned")
-                            .push(composeDslActionEvent(
-                                "intermediate",
-                                None,
-                                Some(&intermediate),
-                            ));
-                    })),
-                )
-                .await;
-            for event in intermediateEvents
-                .lock()
-                .expect("compose dsl intermediate event mutex poisoned")
-                .iter()
-                .cloned()
-            {
-                collector(event);
-            }
-            match result {
-                Ok(Some(result)) => collector(composeDslActionEvent("final", None, Some(&result))),
-                Ok(None) => {}
-                Err(error) => collector(composeDslActionEvent("error", Some(&error.message), None)),
-            }
-            collector(composeDslActionEvent("complete", None, None));
-        })
-    }
-}
-
-#[allow(non_snake_case)]
-fn composeDslActionEvent(phase: &str, error: Option<&str>, result: Option<&str>) -> String {
-    let mut object = serde_json::Map::new();
-    object.insert("phase".to_string(), Value::String(phase.to_string()));
-    if let Some(error) = error {
-        object.insert("error".to_string(), Value::String(error.to_string()));
-    }
-    if let Some(result) = result {
-        object.insert("result".to_string(), Value::String(result.to_string()));
-    }
-    Value::Object(object).to_string()
-}
-
-/// Validates and converts one Host JavaScript callback argument list.
-#[allow(non_snake_case)]
-fn exactHostJavaScriptArguments<const N: usize>(
-    functionName: &str,
-    arguments: Vec<String>,
-) -> HostResult<[String; N]> {
-    let argumentCount = arguments.len();
-    arguments.try_into().map_err(|_| {
-        HostError::new(format!(
-            "{functionName} requires {N} arguments, received {argumentCount}"
-        ))
-    })
+/// Preserves the JavaScript UTF-16 hash and wrapping arithmetic without interpreter work per character.
+fn javaScriptSourceFingerprint(source: &str) -> String {
+    let hash = source.encode_utf16().fold(0_u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    });
+    format!("{hash:x}")
 }
 
 impl JsEngineState {
@@ -1130,9 +1027,22 @@ impl JsEngineState {
         executionHost: Option<Arc<dyn JsExecutionHost>>,
         toolPkgContext: Option<ToolPkgExecutionContext>,
         backgroundWake: Arc<Mutex<Option<JsBackgroundWake>>>,
+        lifetimeInterrupt: HostJavaScriptExecutionInterrupt,
+        #[cfg(test)] asyncCallbackWakeEnabled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        // JsEngineWorker::new already validates and binds this host before
+        // creating the runtime state. Keep that same owner for worker requests
+        // and callbacks instead of authenticating the package a second time.
+        let packageBinding = Arc::new(OnceLock::new());
+        if let (Some(host), Some(context)) = (&executionHost, &toolPkgContext) {
+            packageBinding.set(JsPackageBinding {
+                executionHost: host.clone(), context: context.clone(),
+            }).map_err(|_| "ToolPkg execution context is already bound".to_string())?;
+        }
         let (asyncCallbackSender, asyncCallbackReceiver) = mpsc::channel();
         let mut state = Self {
+            lifetimeInterrupt,
+            routeLifetime: tokio::sync::watch::channel(()).0,
             runtime,
             asyncCallbackSender,
             asyncCallbackReceiver,
@@ -1142,10 +1052,35 @@ impl JsEngineState {
             composeDslTextResources: None,
             detachedCallContexts: BTreeMap::new(),
             pendingScriptExecutions: BTreeMap::new(),
+            promiseJobPumpScheduled: Arc::new(AtomicBool::new(false)),
+            registeredScriptSources: BTreeMap::new(),
             jsEnvironmentInitialized: false,
+            packageBinding,
+            #[cfg(test)]
+            asyncCallbackWakeEnabled,
         };
         state.registerHostBindings()?;
+        // Trusted SDK initialization belongs to runtime creation, not a caller's
+        // script deadline. An interrupted partial bootstrap cannot be retried safely.
+        state.initJavaScriptEnvironment()?;
         Ok(state)
+    }
+
+    /// Registers immutable source once per realm, using exact native content equality for reuse.
+    #[allow(non_snake_case)]
+    fn registerScriptSource(&mut self, script: &str) -> Result<String, String> {
+        if let Some(sourceId) = self.registeredScriptSources.get(script) {
+            return Ok(sourceId.clone());
+        }
+        let sourceId = format!("source_{}", self.registeredScriptSources.len());
+        self.runtime
+            .callHostJavaScriptFunction(
+                "__operitRegisterScriptSource",
+                &[Value::String(sourceId.clone()), Value::String(script.to_string())],
+            )
+            .map_err(|error| error.to_string())?;
+        self.registeredScriptSources.insert(script.to_string(), sourceId.clone());
+        Ok(sourceId)
     }
 
     /// Installs every active owner so callbacks advanced by another call retain their context.
@@ -1175,6 +1110,12 @@ impl JsEngineState {
         step: JsScriptRequestStep,
         interrupt: HostJavaScriptExecutionInterrupt,
     ) -> JsExecutionResult<()> {
+        let _logBatch = AppLogger::batch_file_writes();
+        if let JsScriptRequestStep::Start(request) = &step {
+            if let Some(timing) = &request.ipcTiming {
+                timing.mark("engineQueueMs").map_err(javaScriptExecutionErrorFromHost)?;
+            }
+        }
         self.installActiveCallContexts();
         match step {
             JsScriptRequestStep::Start(request) => {
@@ -1184,6 +1125,9 @@ impl JsEngineState {
                     ));
                 }
                 let pending = self.startScriptFunctionForRequest(request)?;
+                if let Some(timing) = &pending.context.ipcTiming {
+                    timing.mark("startSyncMs").map_err(javaScriptExecutionErrorFromHost)?;
+                }
                 self.pendingScriptExecutions
                     .insert(pending.callId.clone(), pending);
                 self.advanceJavaScriptExecutions(interrupt)
@@ -1193,7 +1137,7 @@ impl JsEngineState {
                     installThreadLocalCallContext(&pending.context);
                     self.cancelJavaScriptExecution(&callId);
                 }
-                Ok(())
+                self.advanceJavaScriptExecutions(interrupt)
             }
         }
     }
@@ -1204,7 +1148,10 @@ impl JsEngineState {
         &mut self,
         request: JsScriptRequest,
     ) -> JsExecutionResult<JsPendingScriptExecution> {
+        let startedAtMs = currentTimeMillisU128();
         let JsScriptRequest {
+            submittedAtMs,
+            executionHost,
             callId,
             script,
             functionName,
@@ -1212,13 +1159,14 @@ impl JsEngineState {
             envOverrides,
             onIntermediateResult,
             timeout,
-            timeoutSec,
+            interrupt,
             executionListener,
             textResources,
             useComposeDslTextResources,
             completion,
             cancelled: _,
             deadlineMillis,
+            ipcTiming,
         } = request;
         let textResources = if useComposeDslTextResources {
             if let Some(textResources) = textResources {
@@ -1240,11 +1188,14 @@ impl JsEngineState {
             packageTextResourceSource(self.toolPkgContext.as_ref())
         };
         let context = JsCallContext {
-            executionHost: self.executionHost.clone(),
+            interrupt,
+            executionHost,
             intermediateCallback: onIntermediateResult,
             executionListener,
             envOverrides: Arc::new(Mutex::new(envOverrides)),
+            environmentOwner: environmentOwner(self.toolPkgContext.as_ref(), &params, false)?,
             textResourceSource,
+            ipcTiming,
         };
         installThreadLocalCallContext(&context);
         CURRENT_ACTIVE_CALL_CONTEXTS.with(|contexts| {
@@ -1256,6 +1207,7 @@ impl JsEngineState {
             self.initJavaScriptEnvironment()
                 .map_err(JsExecutionError::initialization)?;
             let mut effectiveParams = params;
+            bindEnvironmentOwner(&mut effectiveParams, context.environmentOwner.as_ref());
             // Async Compose renders and actions need the same API contract as synchronous calls.
             let apiVersion = match self.toolPkgContext.as_ref() {
                 Some(context) => context.api_version.clone(),
@@ -1280,15 +1232,32 @@ impl JsEngineState {
                     .insert("__operit_package_lang".to_string(), Value::String(language));
             }
             clearNativeExecutionSession(&callId);
-            if let Err(error) = self.invokeExecutionFunction(
-                &callId,
-                effectiveParams,
-                &script,
-                &functionName,
-                timeoutSec,
-            ) {
+            let invokeAtMs = currentTimeMillisU128();
+            let scriptBytes = script.len();
+            let sourceCount = self.registeredScriptSources.len();
+            let sourceId = self.registerScriptSource(&script).map_err(JsExecutionError::runtime)?;
+            let sourceRegistered = self.registeredScriptSources.len() != sourceCount;
+            let invocation = self.runtime.callHostJavaScriptFunction(
+                "__operitExecuteScriptFunction",
+                &[
+                    Value::String(callId.clone()),
+                    Value::Object(effectiveParams.into_iter().collect()),
+                    Value::String(sourceId),
+                    Value::String(functionName.clone()),
+                    Value::Bool(useComposeDslTextResources),
+                ],
+            );
+            let completedAtMs = currentTimeMillisU128();
+            AppLogger::trace("JsExecutionTiming", &format!(
+                "kind=js_start callId={} function={} scriptBytes={} sourceRegistered={} queueMs={} initializeMs={} invokeMs={}",
+                callId, functionName, scriptBytes, sourceRegistered,
+                startedAtMs.saturating_sub(submittedAtMs),
+                invokeAtMs.saturating_sub(startedAtMs),
+                completedAtMs.saturating_sub(invokeAtMs),
+            ));
+            if let Err(error) = invocation {
                 self.cancelJavaScriptExecution(&callId);
-                return Err(JsExecutionError::runtime(error));
+                return Err(JsExecutionError::runtime(error.to_string()));
             }
             Ok(JsPendingScriptExecution {
                 callId,
@@ -1325,7 +1294,7 @@ impl JsEngineState {
             *host.borrow_mut() = self.executionHost.clone();
         });
         CURRENT_INTERMEDIATE_CALLBACK.with(|callback| {
-            *callback.borrow_mut() = on_intermediate_result;
+            *callback.borrow_mut() = textIntermediateCallback(on_intermediate_result);
         });
         CURRENT_EXECUTION_LISTENER.with(|listener| {
             *listener.borrow_mut() = executionListener;
@@ -1337,7 +1306,9 @@ impl JsEngineState {
             *source.borrow_mut() = Some(textResourceSource.clone());
         });
 
+        let environmentOwner = environmentOwner(self.toolPkgContext.as_ref(), params, false)?;
         let mut effectiveParams = params.clone();
+        bindEnvironmentOwner(&mut effectiveParams, environmentOwner.as_ref());
         // Standalone scripts use the current SDK contract; ToolPkg engines retain their manifest contract.
         let apiVersion = match self.toolPkgContext.as_ref() {
             Some(context) => context.api_version.clone(),
@@ -1373,13 +1344,16 @@ impl JsEngineState {
             contexts.borrow_mut().insert(
                 callId.clone(),
                 JsCallContext {
+                    interrupt: HostJavaScriptExecutionInterrupt::unlimited(),
                     executionHost: self.executionHost.clone(),
                     intermediateCallback: CURRENT_INTERMEDIATE_CALLBACK
                         .with(|value| value.borrow().clone()),
                     executionListener: CURRENT_EXECUTION_LISTENER
                         .with(|value| value.borrow().clone()),
                     envOverrides: Arc::new(Mutex::new(envOverrides.clone())),
+                    environmentOwner,
                     textResourceSource,
+                    ipcTiming: None,
                 },
             );
         });
@@ -1389,7 +1363,6 @@ impl JsEngineState {
             effectiveParams,
             script,
             functionName,
-            timeoutSec,
         ) {
             Ok(_) => match self.waitForExecutionResult(&callId, timeoutSec) {
                 Ok(output) => output,
@@ -1454,7 +1427,26 @@ impl JsEngineState {
             *current.borrow_mut() = Some(params.clone());
         });
         let registrationResult = (|| {
+            let environmentOwner = environmentOwner(self.toolPkgContext.as_ref(), params, true)?;
+            if let Some(declared) = params.get("__operit_registration_environment_names") {
+                let declared: Vec<String> = serde_json::from_value(declared.clone()).map_err(|error| {
+                    JsExecutionError::invalid_request(format!("Invalid environment declarations: {error}"))
+                })?;
+                if !declared.is_empty() {
+                    let owner = environmentOwner.as_ref().ok_or_else(|| {
+                        JsExecutionError::invalid_request("Environment preparation requires an owning package")
+                    })?;
+                    self.executionHost
+                        .as_ref()
+                        .ok_or_else(|| {
+                            JsExecutionError::invalid_request("Environment preparation requires an execution host")
+                        })?
+                        .prepare_environment(owner, &declared)
+                        .map_err(JsExecutionError::runtime)?;
+                }
+            }
             let mut registrationParams = params.clone();
+            bindEnvironmentOwner(&mut registrationParams, environmentOwner.as_ref());
             registrationParams.insert("__operit_registration_mode".to_string(), Value::Bool(true));
             let explicitLanguage = registrationParams
                 .get("__operit_package_lang")
@@ -1482,17 +1474,20 @@ impl JsEngineState {
                 contexts.borrow_mut().insert(
                     callId.clone(),
                     JsCallContext {
+                    interrupt: HostJavaScriptExecutionInterrupt::unlimited(),
                         executionHost: self.executionHost.clone(),
                         intermediateCallback: None,
                         executionListener: None,
                         envOverrides: Arc::new(Mutex::new(BTreeMap::new())),
+                        environmentOwner,
                         textResourceSource,
+                        ipcTiming: None,
                     },
                 );
             });
             clearNativeExecutionSession(&callId);
             if let Err(error) =
-                self.invokeExecutionFunction(&callId, registrationParams, script, functionName, 60)
+                self.invokeExecutionFunction(&callId, registrationParams, script, functionName)
             {
                 self.cancelJavaScriptExecution(&callId);
                 return Err(JsExecutionError::runtime(error));
@@ -1511,7 +1506,7 @@ impl JsEngineState {
                 }
             };
             clearNativeExecutionSession(&callId);
-            ensureRegistrationExecutionSucceeded(&output).map_err(JsExecutionError::runtime)?;
+            ensureRegistrationExecutionSucceeded(&output?).map_err(JsExecutionError::runtime)?;
 
             let capture = self
                 .runtime
@@ -1550,12 +1545,7 @@ impl JsEngineState {
     /// Cancels one JavaScript call and releases its call-scoped callbacks and timers.
     #[allow(non_snake_case)]
     fn cancelJavaScriptExecution(&mut self, callId: &str) {
-        if let Err(error) = self.runtime.cancelHostJavaScriptPromises(callId) {
-            AppLogger::e(
-                TAG,
-                &format!("cancel structured JavaScript promises failed: {error}"),
-            );
-        }
+        // Retire the session before rejecting host waits: Web can run their cleanup jobs immediately.
         if let Err(error) = self.runtime.callHostJavaScriptFunction(
             "__operitCancelCallSession",
             &[Value::String(callId.to_string())],
@@ -1565,45 +1555,36 @@ impl JsEngineState {
                 &format!("cancel JavaScript execution failed callId={callId}: {error}"),
             );
         }
+        activateCancelledScriptCall(callId.to_owned());
+        if let Err(error) = self.runtime.cancelHostJavaScriptPromises(callId) {
+            AppLogger::e(
+                TAG,
+                &format!("cancel structured JavaScript promises failed: {error}"),
+            );
+        }
     }
 
-    /// Drives active and detached sessions once after a Host callback, never on a timer loop.
+    /// Advances owned callbacks without imposing a shared runtime deadline.
     #[allow(non_snake_case)]
     fn advanceJavaScriptExecutions(
         &mut self,
-        hostInterrupt: HostJavaScriptExecutionInterrupt,
+        _hostInterrupt: HostJavaScriptExecutionInterrupt,
     ) -> JsExecutionResult<()> {
-        // Bound continuations by active request deadlines, including CPU-bound Promise jobs.
-        let now = currentTimeMillisU128();
-        let timeoutMillis =
-            self.pendingScriptExecutions
-                .values()
-                .fold(60_000u64, |bound, pending| {
-                    bound.min(
-                        pending
-                            .deadlineMillis
-                            .saturating_sub(now)
-                            .max(1)
-                            .min(60_000) as u64,
-                    )
-                });
-        let interrupt = HostJavaScriptExecutionInterrupt::new(timeoutMillis)
-            .map_err(javaScriptExecutionErrorFromHost)?;
-        let hostInterruptForHandler = hostInterrupt.clone();
-        let interruptForHandler = interrupt.clone();
-        self.runtime
-            .setHostJavaScriptInterruptHandler(Some(Arc::new(move || {
-                hostInterruptForHandler.shouldInterrupt() || interruptForHandler.shouldInterrupt()
-            })))
-            .map_err(|error| JsExecutionError::initialization(error.to_string()))?;
+        let _logBatch = AppLogger::batch_file_writes();
+        INTERRUPTED_SCRIPT_CALL.with(|call| call.borrow_mut().take());
+        let lifetimeInterrupt = self.lifetimeInterrupt.clone();
+        self.runtime.setHostJavaScriptInterruptHandler(Some(Arc::new(move || lifetimeInterrupt.shouldInterrupt() || activeScriptShouldInterrupt()))).map_err(|error| JsExecutionError::initialization(error.to_string()))?;
         let jobs = self.advanceDetachedJavaScriptExecution();
         self.runtime
             .setHostJavaScriptInterruptHandler(None)
             .map_err(|error| JsExecutionError::runtime(error.to_string()))?;
-        let advanced = if interrupt.didTimeOut() || hostInterrupt.didTimeOut() {
-            Err(JsExecutionError::timeout(
-                "JavaScript continuation exceeded its execution deadline",
-            ))
+        let interruptedCall = INTERRUPTED_SCRIPT_CALL.with(|call| call.borrow_mut().take());
+        let advanced = if let Some((_, timedOut)) = interruptedCall.as_ref() {
+            Err(if *timedOut {
+                JsExecutionError::timeout("Before hook execution timed out")
+            } else {
+                JsExecutionError::worker_unavailable("JavaScript execution was cancelled")
+            })
         } else {
             jobs.map_err(JsExecutionError::runtime)
         };
@@ -1614,21 +1595,17 @@ impl JsEngineState {
             .collect::<Vec<_>>();
         for callId in ids {
             let terminal = match &advanced {
-                Err(error) => Some(Err(error.clone())),
+                Err(error) if interruptedCall.as_ref().is_none_or(|(owner, _)| owner == &callId) => Some(Err(error.clone())),
+                Err(_) => readNativeExecutionSession(&callId).map(|output| output.map(Some)),
                 Ok(()) => {
                     let pending = &self.pendingScriptExecutions[&callId];
-                    if currentTimeMillisU128() >= pending.deadlineMillis {
+                    if pending.deadlineMillis.is_some_and(|deadline| currentTimeMillisU128() >= deadline) {
                         Some(Err(JsExecutionError::timeout(format!(
                             "Script execution timed out after {} milliseconds",
-                            pending.timeout.as_millis(),
+                            pending.timeout.expect("Timed before hook must own a duration").as_millis(),
                         ))))
                     } else {
-                        readNativeExecutionSession(&callId).map(|output| {
-                            match extractJsExecutionErrorMessage(Some(&output)) {
-                                Some(message) => Err(JsExecutionError::runtime(message)),
-                                None => Ok(Some(output)),
-                            }
-                        })
+                        readNativeExecutionSession(&callId).map(|output| output.map(Some))
                     }
                 }
             };
@@ -1646,12 +1623,56 @@ impl JsEngineState {
                 if result.is_err() {
                     self.cancelJavaScriptExecution(&callId);
                 }
+                if let Some(timing) = &pending.context.ipcTiming {
+                    if let Err(error) = timing.mark("activeMs") {
+                        result = Err(javaScriptExecutionErrorFromHost(error));
+                    }
+                }
                 // Retain detached context before publishing the primary result.
                 completeScriptExecution(&pending.completion, result);
             }
         }
         clearThreadLocalCallState();
-        advanced
+        self.armPromiseJobPump();
+        if interruptedCall.is_some() { Ok(()) } else { advanced }
+    }
+
+    /// Re-arms a slow pump while active executions still own ready or pending promise jobs.
+    #[allow(non_snake_case)]
+    fn armPromiseJobPump(&mut self) {
+        if self.pendingScriptExecutions.is_empty() {
+            return;
+        }
+        let delayMillis = PROMISE_JOB_PUMP_MILLIS;
+        if self.promiseJobPumpScheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let wake = self
+            .backgroundWake
+            .lock()
+            .expect("background wake mutex poisoned")
+            .clone();
+        let Some(wake) = wake else {
+            self.promiseJobPumpScheduled.store(false, Ordering::Release);
+            return;
+        };
+        let pumpScheduled = self.promiseJobPumpScheduled.clone();
+        let scheduled = defaultHostRuntimeTaskSchedulerHost()
+            .scheduleDelayedHostRuntimeTask(
+                "operit-js-promise-job-pump",
+                delayMillis,
+                Box::new(move || {
+                    pumpScheduled.store(false, Ordering::Release);
+                    wake();
+                }),
+            );
+        if let Err(error) = scheduled {
+            self.promiseJobPumpScheduled.store(false, Ordering::Release);
+            AppLogger::e(
+                TAG,
+                &format!("schedule JavaScript promise job pump failed: {error}"),
+            );
+        }
     }
 
     /// Advances detached JavaScript calls after their original request has returned.
@@ -1724,7 +1745,7 @@ impl JsEngineState {
         Ok(())
     }
 
-    /// Retains the callback context while a JavaScript call owns detached timers.
+    /// Retains the callback context while a call owns pending Promise reactions or host work.
     fn rememberDetachedCallContext(
         &mut self,
         pending: &JsPendingScriptExecution,
@@ -1773,7 +1794,7 @@ impl JsEngineState {
                 return Err(JsExecutionError::runtime(error));
             }
             if let Some(output) = readNativeExecutionSession(callId) {
-                return Ok(Some(output));
+                return textScriptResult(output.map(Some));
             }
             let nowMillis = currentTimeMillisU128();
             if nowMillis >= deadlineMillis {
@@ -1812,18 +1833,18 @@ impl JsEngineState {
     #[allow(non_snake_case)]
     fn deliverAsyncCallback(&mut self, callback: JsAsyncCallback) -> Result<(), String> {
         match callback {
-            JsAsyncCallback::Promise {
-                requestId,
-                result,
-                reject,
-            } => self
-                .runtime
-                .settleHostJavaScriptPromise(requestId, &result, reject),
-            JsAsyncCallback::CancelScope { scope } => {
-                self.runtime.cancelHostJavaScriptPromises(&scope)
+            JsAsyncCallback::Promise { requestId, result, reject } => {
+                self.runtime.settleHostJavaScriptPromise(requestId, result, reject)
             }
-        }
-        .map_err(|error| error.to_string())
+            JsAsyncCallback::ProfiledToolResult { requestId, result, timing, successful } => {
+                timing.mark("callbackQueueMs").map_err(|error| error.to_string())?;
+                let settled = self.runtime.settleHostJavaScriptPromise(requestId, result, false);
+                timing.mark("callbackSettleMs").map_err(|error| error.to_string())?;
+                timing.log(successful && settled.is_ok());
+                settled
+            }
+            JsAsyncCallback::CancelScope { scope } => self.runtime.cancelHostJavaScriptPromises(&scope),
+        }.map_err(|error| error.to_string())
     }
 
     #[allow(non_snake_case)]
@@ -1847,18 +1868,16 @@ impl JsEngineState {
         params: BTreeMap<String, Value>,
         script: &str,
         functionName: &str,
-        timeoutSec: u64,
     ) -> Result<(), String> {
+        let sourceId = self.registerScriptSource(script)?;
         self.runtime
             .callHostJavaScriptFunction(
                 "__operitExecuteScriptFunction",
                 &[
                     Value::String(callId.to_string()),
                     Value::Object(params.into_iter().collect()),
-                    Value::String(script.to_string()),
+                    Value::String(sourceId),
                     Value::String(functionName.to_string()),
-                    Value::from(timeoutSec),
-                    Value::from(10_000u64),
                 ],
             )
             .map(|_| ())
@@ -1868,7 +1887,20 @@ impl JsEngineState {
     /// Installs the single structured host transport for synchronous and Promise-backed operations.
     #[allow(non_snake_case)]
     fn registerHostBindings(&mut self) -> Result<(), String> {
+        self.runtime
+            .registerHostJavaScriptFunctionConstructor(
+                "__operitNativeCompileModuleFactory",
+                &["module", "exports", "require", "__operit_call_runtime"],
+            )
+            .map_err(|error| error.to_string())?;
         let syncNames = [
+            "__operitNativePrepareComposeModule",
+            "__operitNativeReadBootstrapLibrary",
+            "__operitNativeHashText",
+            "__operitNativeGetPluginLocalDataDir",
+            "__operitNativeGetPluginSpaceDataDir",
+            "__operitNativeSetCallStructuredResult",
+            "__operitNativeSendStructuredIntermediate",
             "__operitNativeReadToolPkgTextResource",
             "__operitNativeGetEnvForCall",
             "__operitNativeSetEnv",
@@ -1877,6 +1909,8 @@ impl JsEngineState {
             "__operitNativeGetToolCatalog",
             "__operitNativeComposeWebViewControllerCommand",
             "__operitNativeLog",
+            "__operitNativeLogVerbose",
+            "__operitNativeRegisterMedia",
             "__operitNativeDecompress",
             "__operitNativeCrypto",
             "__operitNativeJavaClassExists",
@@ -1889,14 +1923,17 @@ impl JsEngineState {
             "__operitNativeJavaGetStaticField",
             "__operitNativeJavaSetStaticField",
             "__operitSendIntermediateResult",
+            "__operitNativeActivateCall",
             "__operitNativeSetCallResult",
             "__operitNativeSetCallError",
             "__operitNativeNotifyDetachedCall",
             "__operitNativeLogJsExecutionTrace",
+            "__operitNativeCloseCoreRouteWatch",
+            "__operitNativeShouldRouteToolPkg",
         ];
         for name in syncNames {
             self.runtime
-                .registerHostJavaScriptJsonFunction(
+                .registerHostJavaScriptFunction(
                     name,
                     Arc::new(move |arguments| executeHostOperation(name, arguments)),
                 )
@@ -1905,8 +1942,14 @@ impl JsEngineState {
 
         let asyncCallbackSender = self.asyncCallbackSender.clone();
         let backgroundWake = self.backgroundWake.clone();
+        #[cfg(test)]
+        let asyncCallbackWakeEnabled = self.asyncCallbackWakeEnabled.clone();
         let asyncCallbackSink: JsAsyncCallbackSink = Arc::new(move |callback| {
             let _ = asyncCallbackSender.send(callback);
+            #[cfg(test)]
+            if !asyncCallbackWakeEnabled.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(wake) = backgroundWake
                 .lock()
                 .expect("background wake mutex poisoned")
@@ -1915,21 +1958,32 @@ impl JsEngineState {
                 wake();
             }
         });
-        let toolHost = self.executionHost.clone();
         let toolSink = asyncCallbackSink.clone();
         let timerSink = asyncCallbackSink.clone();
-        let ipcHost = self.executionHost.clone();
+        let ipcBinding = self.packageBinding.clone();
         let ipcSink = asyncCallbackSink.clone();
-        let ipcContext = self.toolPkgContext.clone();
-        let dependencyHost = self.executionHost.clone();
+        let dependencyBinding = self.packageBinding.clone();
         let dependencySink = asyncCallbackSink.clone();
-        let dependencyContext = self.toolPkgContext.clone();
+        let callRouteSink = asyncCallbackSink.clone();
+        let openRouteWatchSink = asyncCallbackSink.clone();
+        let nextRouteWatchSink = asyncCallbackSink.clone();
+        let storageRecordSink = asyncCallbackSink.clone();
+        let storageRecordLifetime = self.routeLifetime.subscribe();
+        let callRouteLifetime = self.routeLifetime.subscribe();
+        let openRouteWatchLifetime = self.routeLifetime.subscribe();
+        let nextRouteWatchLifetime = self.routeLifetime.subscribe();
+        let openRoutePushLifetime = self.routeLifetime.subscribe();
+        let sendRoutePushLifetime = self.routeLifetime.subscribe();
+        let closeRoutePushLifetime = self.routeLifetime.subscribe();
+        let openRoutePushSink = asyncCallbackSink.clone();
+        let sendRoutePushSink = asyncCallbackSink.clone();
+        let closeRoutePushSink = asyncCallbackSink.clone();
         let asyncFunctions: Vec<(&str, HostJavaScriptAsyncJsonCallback)> = vec![
             (
                 "__operitNativeCallToolStructured",
                 Arc::new(move |requestId, arguments| {
                     dispatchStructuredToolCall(
-                        toolHost.clone(),
+                        CURRENT_EXECUTION_HOST.with(|host| host.borrow().clone()),
                         toolSink.clone(),
                         requestId,
                         arguments,
@@ -1960,9 +2014,10 @@ impl JsEngineState {
                             arguments,
                         )?;
                     let packageTarget = hostJavaScriptStringArgument(packageTarget)?;
-                    let context = ipcContext.as_ref().ok_or_else(|| {
+                    let binding = ipcBinding.get().ok_or_else(|| {
                         HostError::new("ToolPkg IPC requires a bound package context")
                     })?;
+                    let context = &binding.context;
                     if packageTarget != context.container_package_name {
                         return Err(HostError::new(
                             "Package-private IPC cannot target another package",
@@ -1977,7 +2032,7 @@ impl JsEngineState {
                         payload,
                     )
                     .map_err(HostError::new)?;
-                    dispatchToolPkgIpcAsync(ipcHost.clone(), ipcSink.clone(), requestId, request);
+                    dispatchToolPkgIpcAsync(Some(binding.executionHost.clone()), ipcSink.clone(), requestId, request);
                     Ok(())
                 }),
             ),
@@ -1988,9 +2043,10 @@ impl JsEngineState {
                         "__operitNativeCallDependency",
                         arguments,
                     )?;
-                    let context = dependencyContext.as_ref().ok_or_else(|| {
+                    let binding = dependencyBinding.get().ok_or_else(|| {
                         HostError::new("Dependency calls require a bound ToolPkg context")
                     })?;
+                    let context = &binding.context;
                     let mut request = buildToolPkgIpcRequest(
                         hostJavaScriptStringArgument(packageTarget)?,
                         context.context_key.clone(),
@@ -2002,11 +2058,131 @@ impl JsEngineState {
                     .map_err(HostError::new)?;
                     request.dependency_caller = Some(context.container_package_name.clone());
                     dispatchToolPkgIpcAsync(
-                        dependencyHost.clone(),
+                        Some(binding.executionHost.clone()),
                         dependencySink.clone(),
                         requestId,
                         request,
                     );
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeCallCoreRoute",
+                Arc::new(move |requestId, arguments| {
+                    let [target, method, args] = exactHostJavaScriptJsonArguments(
+                        "__operitNativeCallCoreRoute",
+                        arguments,
+                    )?;
+                    let host = CURRENT_EXECUTION_HOST.with(|value| value.borrow().clone());
+                    let Some(host) = host else {
+                        return Err(HostError::new("JavaScript execution host is unavailable"));
+                    };
+                    let target = hostJavaScriptStringArgument(target)?;
+                    let method = hostJavaScriptStringArgument(method)?;
+                    dispatchCoreRouteAsync(
+                        Some(host.clone()),
+                        callRouteSink.clone(),
+                        callRouteLifetime.clone(),
+                        requestId,
+                        Box::new(move || host.call_core_route(target, method, args)),
+                    );
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeOpenCoreRouteWatch",
+                Arc::new(move |requestId, arguments| {
+                    let [target, property, args] = exactHostJavaScriptJsonArguments(
+                        "__operitNativeOpenCoreRouteWatch",
+                        arguments,
+                    )?;
+                    let host = CURRENT_EXECUTION_HOST.with(|value| value.borrow().clone());
+                    let Some(host) = host else {
+                        return Err(HostError::new("JavaScript execution host is unavailable"));
+                    };
+                    let target = hostJavaScriptStringArgument(target)?;
+                    let property = hostJavaScriptStringArgument(property)?;
+                    dispatchCoreRouteAsync(
+                        Some(host.clone()),
+                        openRouteWatchSink.clone(),
+                        openRouteWatchLifetime.clone(),
+                        requestId,
+                        Box::new(move || host.open_core_route_watch(target, property, args)),
+                    );
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeNextCoreRouteWatch",
+                Arc::new(move |requestId, arguments| {
+                    let [subscription] = exactHostJavaScriptJsonArguments(
+                        "__operitNativeNextCoreRouteWatch",
+                        arguments,
+                    )?;
+                    let host = CURRENT_EXECUTION_HOST.with(|value| value.borrow().clone());
+                    let Some(host) = host else {
+                        return Err(HostError::new("JavaScript execution host is unavailable"));
+                    };
+                    let subscription = hostJavaScriptStringArgument(subscription)?;
+                    dispatchCoreRouteAsync(
+                        Some(host.clone()),
+                        nextRouteWatchSink.clone(),
+                        nextRouteWatchLifetime.clone(),
+                        requestId,
+                        Box::new(move || host.next_core_route_watch(subscription)),
+                    );
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeOpenToolPkgRoutePush",
+                Arc::new(move |requestId, arguments| {
+                    let [method, args] = exactHostJavaScriptJsonArguments("__operitNativeOpenToolPkgRoutePush", arguments)?;
+                    let host = currentExecutionHost().map_err(HostError::new)?;
+                    let method = hostJavaScriptStringArgument(method)?;
+                    dispatchCoreRouteAsync(Some(host.clone()), openRoutePushSink.clone(), openRoutePushLifetime.clone(), requestId,
+                        Box::new(move || host.open_toolpkg_route_push(method, args)));
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeSendToolPkgRoutePush",
+                Arc::new(move |requestId, arguments| {
+                    let [id, value] = exactHostJavaScriptJsonArguments("__operitNativeSendToolPkgRoutePush", arguments)?;
+                    let host = currentExecutionHost().map_err(HostError::new)?;
+                    let id = hostJavaScriptStringArgument(id)?;
+                    dispatchCoreRouteAsync(Some(host.clone()), sendRoutePushSink.clone(), sendRoutePushLifetime.clone(), requestId,
+                        Box::new(move || host.send_toolpkg_route_push(id, value)));
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeCloseToolPkgRoutePush",
+                Arc::new(move |requestId, arguments| {
+                    let [id, abort] = exactHostJavaScriptJsonArguments("__operitNativeCloseToolPkgRoutePush", arguments)?;
+                    let host = currentExecutionHost().map_err(HostError::new)?;
+                    let id = hostJavaScriptStringArgument(id)?;
+                    let abort = abort.as_bool().ok_or_else(|| HostError::new("Push abort flag must be a boolean"))?;
+                    dispatchCoreRouteAsync(Some(host.clone()), closeRoutePushSink.clone(), closeRoutePushLifetime.clone(), requestId,
+                        Box::new(move || host.close_toolpkg_route_push(id, abort)));
+                    Ok(())
+                }),
+            ),
+            (
+                "__operitNativeWaitPluginStorageRecord",
+                Arc::new(move |requestId, arguments| {
+                    let [handle, collection, key, after] = exactHostJavaScriptJsonArguments(
+                        "__operitNativeWaitPluginStorageRecord", arguments,
+                    )?;
+                    let host = currentExecutionHost().map_err(HostError::new)?;
+                    let handle = hostJavaScriptStringArgument(handle)?;
+                    let collection = hostJavaScriptStringArgument(collection)?;
+                    let key = hostJavaScriptStringArgument(key)?;
+                    let after = serde_json::from_value(after.clone())
+                        .map_err(|error| HostError::new(format!("Invalid record watch state: {error}")))?;
+                    dispatchCoreRouteAsync(Some(host.clone()), storageRecordSink.clone(),
+                        storageRecordLifetime.clone(), requestId,
+                        Box::new(move || host.wait_plugin_storage_record(handle, collection, key, after)));
                     Ok(())
                 }),
             ),
@@ -2022,6 +2198,7 @@ impl JsEngineState {
             "__operitNativeImageProcessing",
             "__operitNativeComposeWebViewControllerCommandSuspend",
             "__operitNativeComposeFilePickerCommand",
+            "__operitNativeComposeFileSaveCommand",
             "__operitNativeIsPackageImported",
             "__operitNativeImportPackage",
             "__operitNativeRemovePackage",
@@ -2051,7 +2228,7 @@ impl JsEngineState {
         }
         let cancellationSink = asyncCallbackSink.clone();
         self.runtime
-            .registerHostJavaScriptJsonFunction(
+            .registerHostJavaScriptFunction(
                 "__operitNativeCancelJavaScriptPromises",
                 Arc::new(move |arguments| {
                     let [scope] = exactHostJavaScriptJsonArguments(
@@ -2073,7 +2250,8 @@ impl JsEngineState {
             return Ok(());
         }
         let bootstrap = buildRuntimeBootstrapScript();
-        self.evalJavaScriptVoid(&bootstrap)?;
+        self.runtime.evaluateHostJavaScriptBootstrap(bootstrap)
+            .map_err(|error| error.to_string())?;
         self.jsEnvironmentInitialized = true;
         Ok(())
     }
@@ -2083,8 +2261,9 @@ impl JsEngineState {
 #[allow(non_snake_case)]
 fn exactHostJavaScriptJsonArguments<const N: usize>(
     name: &str,
-    arguments: Vec<Value>,
+    arguments: Vec<impl Into<operit_host_api::HostJavaScriptValue>>,
 ) -> HostResult<[Value; N]> {
+    let arguments = arguments.into_iter().map(|value| value.into().into_json()).collect::<HostResult<Vec<_>>>()?;
     let count = arguments.len();
     arguments
         .try_into()
@@ -2117,10 +2296,12 @@ fn dispatchStructuredToolCall(
             reject: false,
         })
     };
-    let [toolType, toolName, params]: [Value; 3] = match arguments.try_into() {
+    let mut arguments = arguments;
+    let device = if arguments.len() == 5 { arguments.pop() } else { None };
+    let [toolType, toolName, params, callId]: [Value; 4] = match arguments.try_into() {
         Ok(arguments) => arguments,
         Err(_) => {
-            fail("Structured tool call requires three arguments".to_string());
+            fail("Structured tool call requires type, name, params, owning call ID and optional device metadata".to_string());
             return;
         }
     };
@@ -2128,28 +2309,77 @@ fn dispatchStructuredToolCall(
         fail("Tool type and name must be strings".to_string());
         return;
     };
-    let request = match JsHostOperations::parseToolCallValue(toolType, toolName, params) {
+    let Some(callId) = callId.as_str() else {
+        fail("Tool owning call ID must be a string".to_string());
+        return;
+    };
+    let context = CURRENT_ACTIVE_CALL_CONTEXTS.with(|contexts| contexts.borrow().get(callId).cloned());
+    let Some(context) = context else {
+        fail("Tool call requires an active owning call".to_string());
+        return;
+    };
+    let timing = match context.ipcTiming.as_ref().map(|parent| {
+        JsIpcTiming::new(parent.traceId.clone(), callId.to_string(), "tool",
+            format!("{requestId}:{toolType}:{toolName}"))
+    }).transpose() {
+        Ok(timing) => timing,
+        Err(error) => { fail(error.to_string()); return; }
+    };
+    let mut request = match JsHostOperations::parseToolCallValue(toolType, toolName, params) {
         Ok(request) => request,
         Err(error) => {
             fail(error);
             return;
         }
     };
+    if let Some(device) = device {
+        let metadata = serde_json::from_value::<operit_plugin_sdk::javascript::JsDeviceToolCall>(device)
+            .map_err(|error| format!("Invalid device metadata: {error}"))
+            .and_then(|metadata| { metadata.validate()?; Ok(metadata) });
+        match metadata {
+            Ok(metadata) => request.device = Some(metadata),
+            Err(error) => { fail(error); return; }
+        }
+    }
     let Some(executionHost) = executionHost else {
         fail("JavaScript execution host is unavailable".to_string());
         return;
     };
+    // Reserve device invocations before scheduling so an immediate cancel cannot overtake
+    // the original call. Execution itself remains asynchronous on the host scheduler.
+    let completion = if request.device.is_some() {
+        executionHost.execute_tool_call(request)
+    } else {
+        Box::pin(async move { executionHost.execute_tool_call(request).await })
+    };
     let sink = callbackSink.clone();
-    let scheduled = defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeAsyncTask(
+    // Tool executors may perform blocking host calls (terminal sessions, device
+    // commands, package I/O), so they run on the blocking pool. Coordination
+    // deadlines and promise pumps must stay responsive behind a busy tool.
+    let scheduled = defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeBlockingAsyncTask(
         "operit-js-tool-call",
         Box::new(move || {
             Box::pin(async move {
-                let result = executionHost.execute_tool_call(request).await;
-                sink(JsAsyncCallback::Promise {
-                    requestId,
-                    result: JsHostOperations::toolExecutionResultValue(result),
-                    reject: false,
-                });
+                let result = async {
+                    if let Some(timing) = &timing { timing.mark("schedulerWaitMs")?; }
+                    let result = completion.await;
+                    let successful = result.success;
+                    if let Some(timing) = &timing { timing.mark("hostExecuteMs")?; }
+                    let value = JsHostOperations::toolExecutionResultValue(result);
+                    if let Some(timing) = &timing { timing.mark("resultEncodeMs")?; }
+                    Ok::<_, HostError>((value, successful))
+                }.await;
+                let (value, successful) = match result {
+                    Ok(result) => result,
+                    Err(error) => (serde_json::json!({"success": false, "message": error.to_string()}), false),
+                };
+                let callback = match timing {
+                    Some(timing) => JsAsyncCallback::ProfiledToolResult {
+                        requestId, result: value, timing, successful,
+                    },
+                    None => JsAsyncCallback::Promise { requestId, result: value, reject: false },
+                };
+                sink(callback);
             })
         }),
     );
@@ -2226,6 +2456,57 @@ fn dispatchToolPkgIpcAsync(
     }
 }
 
+/// Schedules one Core route Promise and settles it on the owning JavaScript runtime.
+#[allow(non_snake_case)]
+fn dispatchCoreRouteAsync(
+    executionHost: Option<Arc<dyn JsExecutionHost>>,
+    callbackSink: JsAsyncCallbackSink,
+    mut lifetime: tokio::sync::watch::Receiver<()>,
+    requestId: u64,
+    completion: Box<dyn FnOnce() -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<Value, String>> + Send>,
+) {
+    let Some(_executionHost) = executionHost else {
+        callbackSink(JsAsyncCallback::Promise {
+            requestId,
+            result: Value::String("JavaScript execution host is unavailable".to_string()),
+            reject: true,
+        });
+        return;
+    };
+    let sink = callbackSink.clone();
+    let scheduled = defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeAsyncTask(
+        "operit-core-route",
+        Box::new(move || {
+            Box::pin(async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = lifetime.changed() => return,
+                    result = completion() => result,
+                };
+                match result {
+                    Ok(value) => sink(JsAsyncCallback::Promise {
+                        requestId,
+                        result: value,
+                        reject: false,
+                    }),
+                    Err(error) => sink(JsAsyncCallback::Promise {
+                        requestId,
+                        result: Value::String(error),
+                        reject: true,
+                    }),
+                }
+            })
+        }),
+    );
+    if let Err(error) = scheduled {
+        callbackSink(JsAsyncCallback::Promise {
+            requestId,
+            result: Value::String(error.to_string()),
+            reject: true,
+        });
+    }
+}
+
 /// Validates owned structured IPC data against the host routing contract.
 #[allow(non_snake_case)]
 fn buildToolPkgIpcRequest(
@@ -2268,6 +2549,7 @@ fn buildToolPkgIpcRequest(
 
 #[allow(non_snake_case)]
 fn clearThreadLocalCallState() {
+    CURRENT_SCRIPT_INTERRUPT.with(|current| current.borrow_mut().take());
     CURRENT_ACTIVE_CALL_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
     CURRENT_EXECUTION_HOST.with(|host| {
         *host.borrow_mut() = None;
@@ -2286,7 +2568,7 @@ fn clearThreadLocalCallState() {
     });
 }
 
-/// Installs one engine-owned call context for the next QuickJS execution step.
+/// Installs one engine-owned call context for the next Host JavaScript execution step.
 #[allow(non_snake_case)]
 fn installThreadLocalCallContext(context: &JsCallContext) {
     CURRENT_EXECUTION_HOST.with(|host| {
@@ -2418,7 +2700,6 @@ impl JsExecutionEngine for JsEngine {
         envOverrides: &BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatchIntermediateOnMain: bool,
-        timeoutSec: u64,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
         JsEngine::execute_script_function(
             self,
@@ -2428,7 +2709,6 @@ impl JsExecutionEngine for JsEngine {
             envOverrides,
             on_intermediate_result,
             dispatchIntermediateOnMain,
-            timeoutSec,
             None,
         )
     }
@@ -2468,7 +2748,6 @@ impl JsExecutionEngine for JsEngine {
         envOverrides: BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatchIntermediateOnMain: bool,
-        timeoutMillis: u64,
     ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
         JsEngine::execute_script_function_async(
             self,
@@ -2478,7 +2757,6 @@ impl JsExecutionEngine for JsEngine {
             envOverrides,
             on_intermediate_result,
             dispatchIntermediateOnMain,
-            timeoutMillis,
             None,
         )
     }
@@ -2501,79 +2779,32 @@ impl JsExecutionEngine for JsEngine {
         )
     }
 
-    /// Executes one Compose DSL render script through this engine.
-    #[allow(non_snake_case)]
-    fn execute_compose_dsl_script(
-        &self,
-        script: &str,
-        runtimeOptions: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-        textResources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        JsEngine::execute_compose_dsl_script(
-            self,
-            script,
-            runtimeOptions,
-            envOverrides,
-            textResources,
-        )
-    }
-
-    /// Executes one Compose DSL render through the asynchronous engine contract.
-    #[allow(non_snake_case)]
-    fn execute_compose_dsl_script_async(
-        &self,
-        script: String,
-        runtimeOptions: BTreeMap<String, Value>,
-        envOverrides: BTreeMap<String, String>,
-        textResources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        JsEngine::execute_compose_dsl_script_async(
-            self,
-            script,
-            runtimeOptions,
-            envOverrides,
-            textResources,
-        )
-    }
-
-    /// Dispatches one Compose DSL action through this engine.
-    #[allow(non_snake_case)]
-    fn dispatch_compose_dsl_action(
-        &self,
-        actionId: &str,
-        payload: Option<Value>,
-        runtimeOptions: &BTreeMap<String, Value>,
-        envOverrides: &BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
-        JsEngine::execute_compose_dsl_action(
-            self,
-            actionId,
-            payload,
-            runtimeOptions,
-            envOverrides,
-            on_intermediate_result,
-        )
+    /// Streams render responses directly from the retained commit's owning JavaScript call.
+    fn execute_compose_dsl_script_stream_async(
+        &self, script: String, runtime_options: BTreeMap<String, Value>,
+        env_overrides: BTreeMap<String, String>, text_resources: Arc<ToolPkgTextResources>,
+        on_response: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+        JsEngine::execute_compose_dsl_script_stream_async(self, script, runtime_options, env_overrides, text_resources, on_response)
     }
 
     /// Dispatches one Compose DSL action through the asynchronous engine contract.
     #[allow(non_snake_case)]
-    fn dispatch_compose_dsl_action_result_async(
+    fn dispatch_compose_dsl_action_stream_async(
         &self,
         actionId: String,
         payload: Option<Value>,
         runtimeOptions: BTreeMap<String, Value>,
         envOverrides: BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>> {
-        JsEngine::dispatch_compose_dsl_action_result_async(
+        on_response: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>> {
+        JsEngine::dispatch_compose_dsl_action_stream_async(
             self,
             actionId,
             payload,
             runtimeOptions,
             envOverrides,
-            on_intermediate_result,
+            on_response,
         )
     }
 
@@ -2600,15 +2831,141 @@ fn deliverIntermediateResult(callId: String, result: String) -> HostResult<()> {
         listener.on_intermediate_result(&callId, &result);
     }
     if let Some(callback) = context.intermediateCallback {
-        callback(result);
+        callback(Value::String(result).into());
     }
     Ok(())
 }
 
-/// Executes one named host capability using typed structured arguments and results.
+/// Adapts the ordinary-script result contract without interpreting DSL objects as text.
+fn textScriptCompletion(completion: JsExecutionCompletion<JsExecutionResult<Option<Value>>>) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+    Box::pin(async move { textScriptResult(completion.await) })
+}
+
+/// Extracts the explicit text variant used by existing non-DSL callers.
+fn textScriptResult(result: JsExecutionResult<Option<Value>>) -> JsExecutionResult<Option<String>> {
+    match result? {
+        None => Ok(None),
+        Some(Value::String(text)) => match extractJsExecutionErrorMessage(Some(&text)) {
+            Some(message) => Err(JsExecutionError::runtime(message)),
+            None => Ok(Some(text)),
+        },
+        Some(_) => Err(JsExecutionError::serialization("Ordinary script returned a structured DSL result")),
+    }
+}
+
+/// Preserves text callbacks for ordinary scripts while keeping the internal channel structured.
+fn textIntermediateCallback(callback: Option<Arc<dyn Fn(String) + Send + Sync>>) -> Option<Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>> {
+    callback.map(|callback| Arc::new(move |value| {
+        let operit_host_api::HostJavaScriptValue::Json(Value::String(text)) = value else { panic!("Text intermediate callback received a non-text value"); };
+        callback(text);
+    }) as Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>)
+}
+
+/// Delivers DSL values to their active or detached execution owner without JSON text.
+fn sendStructuredIntermediate(callId: &str, value: operit_host_api::HostJavaScriptValue) {
+    let active = CURRENT_ACTIVE_CALL_CONTEXTS.with(|contexts| contexts.borrow().get(callId).and_then(|context| context.intermediateCallback.clone()));
+    let detached = CURRENT_DETACHED_INTERMEDIATE_CALLBACKS.with(|callbacks| callbacks.borrow().get(callId).cloned());
+    match (active, detached) {
+        (Some(callback), _) => callback(value),
+        (None, Some(callback)) => callback(value),
+        (None, None) => {},
+    }
+}
+
 #[allow(non_snake_case)]
-fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> {
+fn executeHostOperation(name: &str, arguments: Vec<impl Into<operit_host_api::HostJavaScriptValue>>) -> HostResult<Value> {
+    use operit_host_api::HostJavaScriptValue;
+    let arguments: Vec<HostJavaScriptValue> = arguments.into_iter().map(Into::into).collect();
+    if name == "__operitNativeSendStructuredIntermediate" {
+        let [call_id, value]: [_; 2] = arguments.try_into().map_err(|_| HostError::new("Compose response requires its owner and one binary frame"))?;
+        let call_id = hostJavaScriptStringArgument(call_id.into_json()?)?;
+        sendStructuredIntermediate(&call_id, value);
+        return Ok(Value::Null);
+    }
+    let arguments = arguments.into_iter().map(HostJavaScriptValue::into_json).collect::<HostResult<Vec<_>>>()?;
+    if name == "__operitNativeActivateCall" {
+        let [callId, cancelled] = exactHostJavaScriptJsonArguments(name, arguments)?;
+        let callId = hostJavaScriptStringArgument(callId)?;
+        let cancelled = hostJavaScriptBoolArgument(cancelled)?;
+        if cancelled {
+            activateCancelledScriptCall(callId);
+        } else {
+            let owner = CURRENT_ACTIVE_CALL_CONTEXTS.with(|contexts| {
+                contexts.borrow().get(&callId).map(|context| (callId.clone(), context.interrupt.clone()))
+            });
+            CURRENT_SCRIPT_INTERRUPT.with(|current| *current.borrow_mut() = owner);
+        }
+        return Ok(Value::Null);
+    }
     match name {
+        "__operitNativeSetCallStructuredResult" => {
+            let [callId, value] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let callId = hostJavaScriptStringArgument(callId)?;
+            if !CURRENT_ACTIVE_CALL_CONTEXTS
+                .with(|contexts| contexts.borrow().contains_key(&callId))
+            {
+                return Err(HostError::new("Completion requires an active owning call"));
+            }
+            CURRENT_CALL_RESULTS.with(|results| {
+                results.borrow_mut().insert(callId, Ok(value));
+            });
+            Ok(Value::Null)
+        }
+        "__operitNativeGetPluginLocalDataDir" | "__operitNativeGetPluginSpaceDataDir" => {
+            let [owner] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let owner = hostJavaScriptStringArgument(owner)?;
+            let host = currentExecutionHost().map_err(HostError::new)?;
+            let local = name == "__operitNativeGetPluginLocalDataDir";
+            let path =
+                CURRENT_REGISTRATION_CONFIG_PARAMS
+                    .with(|current| match current.borrow().as_ref() {
+                        Some(params) => {
+                            let registeredOwner =
+                                params.get("toolPkgId").and_then(Value::as_str).ok_or_else(
+                                    || "ToolPkg registration data owner is missing".to_string(),
+                                )?;
+                            if owner != registeredOwner {
+                                return Err("ToolPkg registration data owner mismatch".to_string());
+                            }
+                            if local {
+                                host.registration_plugin_local_data_dir(registeredOwner)
+                            } else {
+                                host.registration_plugin_space_data_dir(registeredOwner)
+                            }
+                        }
+                        None => {
+                            if local {
+                                host.plugin_local_data_dir(&owner)
+                            } else {
+                                host.plugin_space_data_dir(&owner)
+                            }
+                        }
+                    })
+                    .map_err(HostError::new)?;
+            if !path.starts_with('/') {
+                return Err(HostError::new(
+                    "Plugin data directory must be an absolute VFS path",
+                ));
+            }
+            Ok(Value::String(path))
+        }
+        "__operitNativePrepareComposeModule" => {
+            let [source, identity] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            crate::javascript::JsComposeCompiler::prepareComposeModule(
+                hostJavaScriptStringArgument(source)?, hostJavaScriptStringArgument(identity)?,
+            ).map(Value::String)
+        }
+        "__operitNativeReadBootstrapLibrary" => {
+            let [library] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            loadBootstrapLibrary(&hostJavaScriptStringArgument(library)?)
+                .map(Value::String).map_err(HostError::new)
+        }
+        "__operitNativeHashText" => {
+            let [source] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            Ok(Value::String(javaScriptSourceFingerprint(
+                &hostJavaScriptStringArgument(source)?,
+            )))
+        }
         "__operitNativeReadToolPkgTextResource" => {
             let [package, path] = exactHostJavaScriptJsonArguments(name, arguments)?;
             let package = hostJavaScriptStringArgument(package)?;
@@ -2681,6 +3038,13 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
                 .and_then(|host| host.open_compose_file_picker(&payload))
                 .map_err(HostError::new)
         }
+        "__operitNativeComposeFileSaveCommand" => {
+            let [payload] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            requireHostObject(&payload)?;
+            currentExecutionHost()
+                .and_then(|host| host.save_compose_file(&payload))
+                .map_err(HostError::new)
+        }
         "__operitNativeGetEnvForCall" => {
             let [callId, key] = exactHostJavaScriptJsonArguments(name, arguments)?;
             let callId = hostJavaScriptStringArgument(callId)?;
@@ -2701,7 +3065,8 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
             context
                 .executionHost
                 .ok_or_else(|| HostError::new("JavaScript execution host is unavailable"))?
-                .read_environment_variable(&key)
+                .read_environment_variable(context.environmentOwner.as_ref().ok_or_else(||
+                    HostError::new("Environment access requires an owning package installation"))?, &key)
                 .map(|value| value.map(Value::String).unwrap_or(Value::Null))
                 .map_err(HostError::new)
         }
@@ -2788,6 +3153,14 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
                 .map(Value::String)
                 .map_err(HostError::new)
         }
+        "__operitNativeRegisterMedia" => {
+            let [payload] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let payload = hostJavaScriptStringArgument(payload)?;
+            currentExecutionHost()
+                .and_then(|host| host.register_media(&payload))
+                .map(Value::String)
+                .map_err(HostError::new)
+        }
         "__operitNativeDecompress" => {
             let [data, algorithm] = exactHostJavaScriptJsonArguments(name, arguments)?;
             JsHostOperations::decompress(
@@ -2860,6 +3233,23 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
         | "__operitNativeJavaSetStaticField" => Err(HostError::new(format!(
             "Java host operation is not implemented: {name}"
         ))),
+        "__operitNativeLogVerbose" => {
+            let [level, callId, message] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let level = level
+                .as_i64()
+                .filter(|level| (1..=6).contains(level))
+                .ok_or_else(|| HostError::new("Verbose level must be an integer from 1 to 6"))?
+                as i32;
+            let callId = hostJavaScriptStringArgument(callId)?;
+            let message = hostJavaScriptStringArgument(message)?;
+            let message = if callId.is_empty() {
+                message
+            } else {
+                format!("[{callId}] {message}")
+            };
+            AppLogger::v_with_level("ToolPkg", &message, level);
+            Ok(Value::Null)
+        }
         "__operitNativeLog" => {
             let [level, callId, message] = exactHostJavaScriptJsonArguments(name, arguments)?;
             let level = hostJavaScriptStringArgument(level)?;
@@ -2872,6 +3262,7 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
             };
             match level.as_str() {
                 "info" => AppLogger::i("ToolPkg", &message),
+                "debug" => AppLogger::d("ToolPkg", &message),
                 "warn" => AppLogger::w("ToolPkg", &message),
                 "error" => AppLogger::e("ToolPkg", &message),
                 _ => return Err(HostError::new(format!("Unknown plugin log level: {level}"))),
@@ -2908,7 +3299,22 @@ fn executeHostOperation(name: &str, arguments: Vec<Value>) -> HostResult<Value> 
             let [callId, message] = exactHostJavaScriptJsonArguments(name, arguments)?;
             let callId = hostJavaScriptStringArgument(callId)?;
             let message = hostJavaScriptStringArgument(message)?;
-            AppLogger::d(TAG, &format!("[{callId}] {message}"));
+            AppLogger::trace_detail(TAG, &format!("[{callId}] {message}"));
+            Ok(Value::Null)
+        }
+        "__operitNativeShouldRouteToolPkg" => {
+            let [binding, streaming] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let binding = hostJavaScriptStringArgument(binding)?;
+            let streaming = streaming.as_bool().ok_or_else(|| HostError::new("Route stream flag must be a boolean"))?;
+            currentExecutionHost().map_err(HostError::new)?.should_route_toolpkg(binding, streaming).map(Value::Bool).map_err(HostError::new)
+        }
+        "__operitNativeCloseCoreRouteWatch" => {
+            let [subscription] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            let subscription = hostJavaScriptStringArgument(subscription)?;
+            currentExecutionHost()
+                .map_err(HostError::new)?
+                .close_core_route_watch(subscription)
+                .map_err(HostError::new)?;
             Ok(Value::Null)
         }
         _ => Err(HostError::new(format!(
@@ -2961,7 +3367,7 @@ fn storeExecutionResult(callId: String, result: String) -> HostResult<()> {
         return Err(HostError::new("Completion requires an active owning call"));
     }
     CURRENT_CALL_RESULTS.with(|results| {
-        results.borrow_mut().insert(callId, result);
+        results.borrow_mut().insert(callId, Ok(Value::String(result)));
     });
     Ok(())
 }
@@ -2976,9 +3382,74 @@ fn storeExecutionError(callId: String, error: String) -> HostResult<()> {
         listener.on_failed(&callId, &error);
     }
     CURRENT_CALL_RESULTS.with(|results| {
-        results.borrow_mut().insert(callId, error);
+        results.borrow_mut().insert(callId, Err(JsExecutionError::runtime(extractJsExecutionErrorMessage(Some(&error)).expect("Native error must contain a structured error message"))));
     });
     Ok(())
+}
+
+/// Publishes native ownership metadata for versioned SDK adapters without accepting caller aliases.
+#[allow(non_snake_case)]
+fn bindEnvironmentOwner(params: &mut BTreeMap<String, Value>, owner: Option<&JsEnvironmentOwner>) {
+    params.remove("__operit_environment_owner");
+    if let Some(owner) = owner {
+        params.insert(
+            "__operit_environment_owner".into(),
+            Value::String(owner.package_name().into()),
+        );
+    }
+}
+
+/// Captures the environment owner before JavaScript runs or schedules asynchronous callbacks.
+#[allow(non_snake_case)]
+fn environmentOwner(
+    context: Option<&ToolPkgExecutionContext>,
+    params: &BTreeMap<String, Value>,
+    registration: bool,
+) -> JsExecutionResult<Option<JsEnvironmentOwner>> {
+    if registration {
+        return match params.get("toolPkgId") {
+            None => Ok(None),
+            Some(owner) => {
+                let id = owner
+                    .as_str()
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        JsExecutionError::invalid_request(
+                            "Registration environment owner is invalid",
+                        )
+                    })?;
+                let scope = params
+                    .get("__operit_registration_config_scope")
+                    .ok_or_else(|| {
+                        JsExecutionError::invalid_request(
+                            "ToolPkg registration configuration scope is missing",
+                        )
+                    })?;
+                let scope = serde_json::from_value(scope.clone()).map_err(|error| {
+                    JsExecutionError::invalid_request(format!("Invalid environment scope: {error}"))
+                })?;
+                Ok(Some(JsEnvironmentOwner::Registration {
+                    id: id.to_string(),
+                    scope,
+                }))
+            }
+        };
+    }
+    match context {
+        Some(context) => Ok(Some(JsEnvironmentOwner::Package(
+            context.container_package_name.clone(),
+        ))),
+        None => match params.get("__operit_package_name") {
+            None => Ok(None),
+            Some(name) => name
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| Some(JsEnvironmentOwner::Package(name.to_string())))
+                .ok_or_else(|| {
+                    JsExecutionError::invalid_request("Package environment owner is invalid")
+                }),
+        },
+    }
 }
 
 /// Writes one environment value and records it only after the host accepts the write.
@@ -2994,7 +3465,8 @@ fn setHostEnvironmentValue(callId: &str, key: &str, value: &str) -> HostResult<(
     context
         .executionHost
         .ok_or_else(|| HostError::new("JavaScript execution host is unavailable"))?
-        .write_environment_variable(key, value)
+        .write_environment_variable(context.environmentOwner.as_ref().ok_or_else(||
+            HostError::new("Environment access requires an owning package installation"))?, key, value)
         .map_err(HostError::new)?;
     context
         .envOverrides
@@ -3042,7 +3514,6 @@ fn scopedPluginConfigDirectory(ownerId: String, pluginId: String) -> Result<Stri
     }
     Ok(path)
 }
-
 /// Returns the execution host bound to the active JavaScript call.
 #[allow(non_snake_case)]
 fn currentExecutionHost() -> Result<Arc<dyn JsExecutionHost>, String> {
@@ -3079,7 +3550,7 @@ fn parseBooleanFlag(value: &str) -> bool {
 }
 
 #[allow(non_snake_case)]
-fn readNativeExecutionSession(callId: &str) -> Option<String> {
+fn readNativeExecutionSession(callId: &str) -> Option<JsExecutionResult<Value>> {
     CURRENT_CALL_RESULTS.with(|results| results.borrow().get(callId).cloned())
 }
 
@@ -3090,13 +3561,21 @@ fn clearNativeExecutionSession(callId: &str) {
     });
 }
 
+/// Validates registration after adapting its explicit ordinary-script text result contract.
 #[allow(non_snake_case)]
-fn ensureRegistrationExecutionSucceeded(output: &str) -> Result<(), String> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() || trimmed == "undefined" {
-        return Ok(());
-    }
-    let value = serde_json::from_str::<Value>(trimmed).map_err(|error| error.to_string())?;
+fn ensureRegistrationExecutionSucceeded(value: &Value) -> Result<(), String> {
+    let decoded;
+    let value = match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() || text == "undefined" {
+                return Ok(());
+            }
+            decoded = serde_json::from_str::<Value>(text).map_err(|error| error.to_string())?;
+            &decoded
+        }
+        value => value,
+    };
     if value
         .get("success")
         .and_then(Value::as_bool)
@@ -3110,3 +3589,4 @@ fn ensureRegistrationExecutionSucceeded(output: &str) -> Result<(), String> {
     }
     Ok(())
 }
+

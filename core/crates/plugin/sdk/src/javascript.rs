@@ -16,6 +16,56 @@ pub struct JsToolCallRequest {
     pub tool_type: String,
     pub tool_name: String,
     pub parameters: BTreeMap<String, Value>,
+    /// Transport-owned device selection, kept separate from tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<JsDeviceToolCall>,
+}
+
+/// Selects an explicit Core device and the lifetime of one invocation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JsDeviceToolCall {
+    pub node_id: String,
+    pub invocation_id: String,
+    #[serde(default)]
+    pub action: JsDeviceToolAction,
+    #[serde(default = "defaultDeviceToolTimeout")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsDeviceToolAction {
+    #[default]
+    Execute,
+    /// Executes a native device service on the selected device.
+    Port,
+    /// Carries generic Link Call/Watch/Push operations.
+    Transport,
+    Catalog,
+    Cancel,
+}
+
+#[allow(non_snake_case)]
+fn defaultDeviceToolTimeout() -> u64 {
+    120_000
+}
+
+impl JsDeviceToolCall {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("nodeId", &self.node_id), ("invocationId", &self.invocation_id)] {
+            if value.is_empty()
+                || value.len() > 256
+                || value.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(format!("Invalid device tool {name}"));
+            }
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > 86_400_000 {
+            return Err("Device timeoutMs must be an integer between 1 and 86400000".into());
+        }
+        Ok(())
+    }
 }
 
 impl JsToolCallRequest {
@@ -136,8 +186,33 @@ impl ToolPkgConfigScope {
     }
 }
 
+/// Selects the environment owner from the native execution context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsEnvironmentOwner {
+    Package(String),
+    Registration { id: String, scope: ToolPkgConfigScope },
+}
+
+impl JsEnvironmentOwner {
+    /// Returns the exact installation identity carried by this native execution context.
+    pub fn package_name(&self) -> &str {
+        match self {
+            Self::Package(id) | Self::Registration { id, .. } => id,
+        }
+    }
+}
+
 /// Defines the fixed Rust execution contract required by package JavaScript.
-pub trait JsExecutionHost: crate::js_sdk::JsToolsHost + Send + Sync {
+pub trait JsExecutionHost: Send + Sync {
+    /// Captures immutable native caller state before crossing the JavaScript runtime scheduler.
+    fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost>;
+
+    /// Binds a host instance to an engine-owned authenticated ToolPkg execution context.
+    fn for_toolpkg_execution_context(
+        &self,
+        context: &ToolPkgExecutionContext,
+    ) -> Result<Arc<dyn JsExecutionHost>, String>;
+
     /// Returns the current executable tool catalog with parameter schemas.
     fn get_tool_catalog(&self) -> Result<serde_json::Value, String>;
 
@@ -150,11 +225,27 @@ pub trait JsExecutionHost: crate::js_sdk::JsToolsHost + Send + Sync {
     /// Returns the language code exposed to package JavaScript.
     fn package_language(&self) -> Result<String, String>;
 
+    /// Imports declared legacy values before registration evaluates the owning package.
+    fn prepare_environment(
+        &self,
+        owner: &JsEnvironmentOwner,
+        declared_names: &[String],
+    ) -> Result<(), String>;
+
     /// Reads one environment variable exposed to package JavaScript.
-    fn read_environment_variable(&self, key: &str) -> Result<Option<String>, String>;
+    fn read_environment_variable(
+        &self,
+        owner: &JsEnvironmentOwner,
+        key: &str,
+    ) -> Result<Option<String>, String>;
 
     /// Writes one environment variable exposed to package JavaScript.
-    fn write_environment_variable(&self, key: &str, value: &str) -> Result<(), String>;
+    fn write_environment_variable(
+        &self,
+        owner: &JsEnvironmentOwner,
+        key: &str,
+        value: &str,
+    ) -> Result<(), String>;
 
     /// Returns the writable configuration directory for one plugin.
     fn plugin_config_dir(&self, plugin_id: &str) -> Result<String, String>;
@@ -169,6 +260,18 @@ pub trait JsExecutionHost: crate::js_sdk::JsToolsHost + Send + Sync {
         plugin_id: &str,
         scope: ToolPkgConfigScope,
     ) -> Result<String, String>;
+
+    /// Creates stable device-local data for the current installed package container.
+    fn plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String>;
+
+    /// Creates stable device-local data for the owner selected before registration.
+    fn registration_plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String>;
+
+    /// Creates persistent shared data independently of the package's installation scope.
+    fn plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String>;
+
+    /// Creates persistent shared data for the package selected before registration.
+    fn registration_plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String>;
 
     /// Reads one UTF-8 ToolPkg resource.
     fn read_toolpkg_text_resource(
@@ -195,6 +298,9 @@ pub trait JsExecutionHost: crate::js_sdk::JsToolsHost + Send + Sync {
     /// Opens one Compose DSL file picker through the embedding application's host UI.
     fn open_compose_file_picker(&self, payload: &Value) -> Result<Value, String>;
 
+    /// Saves a UTF-8 export through the embedding application's file selector.
+    fn save_compose_file(&self, payload: &Value) -> Result<Value, String>;
+
     /// Returns whether one package is currently imported.
     fn is_package_imported(&self, package_name: &str) -> Result<bool, String>;
 
@@ -220,6 +326,75 @@ pub trait JsExecutionHost: crate::js_sdk::JsToolsHost + Send + Sync {
         completion: JsToolPkgIpcCompletion,
     ) -> Result<(), String>;
 
+    /// Registers image, audio, or video bytes and returns the canonical link JSON.
+    fn register_media(&self, _request_json: &str) -> Result<String, String> {
+        Err("media registration is not available on this host".to_string())
+    }
+
+    /// Calls one Core route through the Rust route runtime and generated route rules.
+    fn should_route_toolpkg(&self, _binding: String, _streaming: bool) -> Result<bool, String> {
+        Err("Plugin route resolution is unavailable on this host".to_string())
+    }
+
+    /// Opens a plugin consumer using the standard Link Push family.
+    fn open_toolpkg_route_push(&self, _method: String, _args: Value) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Plugin Push is unavailable on this host".to_string()) })
+    }
+
+    /// Sends one ordered value to an authenticated plugin Push session.
+    fn send_toolpkg_route_push(&self, _id: String, _value: Value) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Plugin Push is unavailable on this host".to_string()) })
+    }
+
+    /// Completes or abandons an authenticated plugin Push session.
+    fn close_toolpkg_route_push(&self, _id: String, _abort: bool) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Plugin Push is unavailable on this host".to_string()) })
+    }
+
+    /// Calls an authenticated plugin route using the generated Binding entry point.
+    fn call_core_route(
+        &self,
+        _target: String,
+        _method: String,
+        _args: Value,
+    ) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Core route calls are unavailable on this host".to_string()) })
+    }
+
+    /// Opens one Core route watch and returns its subscription id and initial snapshot.
+    fn open_core_route_watch(
+        &self,
+        _target: String,
+        _property: String,
+        _args: Value,
+    ) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Core route watches are unavailable on this host".to_string()) })
+    }
+
+    /// Waits for one event from an existing Core route watch subscription.
+    fn next_core_route_watch(
+        &self,
+        _subscription_id: String,
+    ) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Core route watches are unavailable on this host".to_string()) })
+    }
+
+    /// Closes one Core route watch subscription.
+    fn close_core_route_watch(&self, _subscription_id: String) -> Result<(), String> {
+        Err("Core route watches are unavailable on this host".to_string())
+    }
+
+    /// Observes one authenticated collection key, emitting its initial state and version changes.
+    fn wait_plugin_storage_record(
+        &self,
+        _handle: String,
+        _collection: String,
+        _key: String,
+        _after: Option<operit_host_api::PluginStorage::StorageRecordWatchState>,
+    ) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Plugin storage record watches are unavailable on this host".to_string()) })
+    }
+
     /// Waits for the host runtime to advance JavaScript work on a later turn.
     fn wait_for_javascript_runtime_turn(&self) -> operit_host_api::HostRuntimeTurnFuture;
 }
@@ -229,7 +404,6 @@ pub trait JsPackageExecutor: Send + Sync {
     /// Executes one package tool through the bound execution context.
     fn execute_package_tool(
         &self,
-        script: &str,
         request: &JsPackageToolCallRequest,
     ) -> JsExecutionCompletion<JsPackageToolCallResult>;
 }
@@ -240,14 +414,21 @@ pub trait JsExecutionProvider: Send + Sync {
     fn create_execution_engine(
         &self,
         execution_host: Arc<dyn JsExecutionHost>,
-    ) -> Arc<dyn JsExecutionEngine>;
+    ) -> Result<Arc<dyn JsExecutionEngine>, String>;
 
     /// Creates one JavaScript engine bound to a ToolPkg package environment.
     fn create_toolpkg_execution_engine(
         &self,
         execution_host: Arc<dyn JsExecutionHost>,
         context: ToolPkgExecutionContext,
-    ) -> Arc<dyn JsExecutionEngine>;
+    ) -> Result<Arc<dyn JsExecutionEngine>, String>;
+
+    /// Acquires a prepared engine and binds its package without blocking the caller.
+    fn acquire_toolpkg_execution_engine(
+        &self,
+        execution_host: Arc<dyn JsExecutionHost>,
+        context: ToolPkgExecutionContext,
+    ) -> JsExecutionFuture<Result<Arc<dyn JsExecutionEngine>, String>>;
 
     /// Creates one package executor bound to caller-owned runtime contracts.
     fn create_package_executor(
@@ -272,26 +453,75 @@ pub struct JsPackageToolCallResult {
     pub error: Option<String>,
 }
 
+/// Captures an exact executable declaration together with its immutable runtime selection.
+#[derive(Clone, Debug)]
+pub struct JsPackageToolSelection {
+    /// Contains the selected registered declaration, including its authoritative script and parameter schema.
+    pub definition: crate::package::PackageTool,
+    /// Contains the selected conditional state when the registered package uses one.
+    pub active_state_id: Option<String>,
+    /// Contains the actual registered owning ToolPkg context for a subpackage.
+    pub toolpkg_runtime: Option<ToolPkgSubpackageRuntime>,
+}
+
+/// Selects an exact executable declaration, rejecting unknown, duplicate, advisory and empty-script entries.
+pub fn select_registered_package_tool(
+    package: ToolPackage,
+    function_name: &str,
+) -> Result<crate::package::PackageTool, String> {
+    let package_name = package.name.clone();
+    let mut matches = package
+        .tools
+        .into_iter()
+        .filter(|tool| tool.name == function_name);
+    let definition = matches
+        .next()
+        .ok_or_else(|| format!("Tool not registered: {package_name}:{function_name}"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "Duplicate tool registration: {package_name}:{function_name}"
+        ));
+    }
+    if definition.advice {
+        return Err(format!(
+            "Tool is advisory and cannot execute: {package_name}:{function_name}"
+        ));
+    }
+    if definition.script.trim().is_empty() {
+        return Err(format!(
+            "Registered tool script is empty: {package_name}:{function_name}"
+        ));
+    }
+    let mut parameters = std::collections::HashSet::new();
+    for parameter in &definition.parameters {
+        if !parameters.insert(&parameter.name) {
+            return Err(format!(
+                "Duplicate tool parameter: {package_name}:{function_name}:{}",
+                parameter.name
+            ));
+        }
+    }
+    Ok(definition)
+}
+
 /// Supplies package state and ToolPkg engines to a JavaScript bridge.
 pub trait JsPackageRuntime: Send + Sync {
     /// Returns the language code exposed to package JavaScript.
     fn package_language(&self) -> Result<String, String>;
 
-    /// Returns one registered package definition.
-    fn package(&self, package_name: &str) -> Option<ToolPackage>;
-
-    /// Returns the active conditional state id for one package.
-    fn active_package_state_id(&self, package_name: &str) -> Option<String>;
-
-    /// Resolves ToolPkg runtime metadata for one executable subpackage.
-    fn resolve_toolpkg_subpackage(&self, package_name: &str) -> Option<ToolPkgSubpackageRuntime>;
+    /// Selects one enabled executable declaration and its owning context from a single registry snapshot.
+    fn select_tool(
+        &self,
+        package_name: &str,
+        function_name: &str,
+    ) -> Result<JsPackageToolSelection, String>;
 
     /// Returns the shared ToolPkg engine for one explicitly owned execution context.
     fn toolpkg_execution_engine(
         &self,
         context_key: &str,
         container_package_name: &str,
-    ) -> Arc<dyn JsExecutionEngine>;
+    ) -> Result<Arc<dyn JsExecutionEngine>, String>;
 }
 
 /// Captured metadata emitted by a package's main registration script.
@@ -323,10 +553,15 @@ pub struct ToolPkgMainRegistrationCapture {
     pub chatViewHooks: Vec<String>,
     #[serde(rename = "chatMessageHooks", default)]
     pub chatMessageHooks: Vec<String>,
+    /// Captures real package-owned lifecycle handler definitions for the strict registration parser.
+    #[serde(rename = "chatLifecycleHooks", default)]
+    pub chatLifecycleHooks: Vec<String>,
     #[serde(rename = "chatMessageMenuItems", default)]
     pub chatMessageMenuItems: Vec<String>,
     #[serde(rename = "chatRuntimeHooks", default)]
     pub chatRuntimeHooks: Vec<String>,
+    #[serde(rename = "chatResponseHooks", default)]
+    pub chatResponseHooks: Vec<String>,
     #[serde(rename = "hostEventHooks", default)]
     pub hostEventHooks: Vec<String>,
     #[serde(rename = "toolLifecycleHooks", default)]
@@ -376,9 +611,20 @@ pub struct ToolPkgExecutionContext {
     pub text_resource_host: Arc<dyn ToolPkgTextResourceHost>,
 }
 
+impl ToolPkgExecutionContext {
+    /// Rejects incomplete native package contexts before an engine attempts authenticated binding.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.context_key.trim().is_empty() || self.context_key.trim() != self.context_key ||
+            self.container_package_name.trim().is_empty() || self.container_package_name.trim() != self.container_package_name {
+            return Err("ToolPkg execution context requires exact nonblank identities".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// JavaScript execution handle supplied by the JS bridge crate.
 pub trait JsExecutionEngine: Send + Sync {
-    /// Executes a named JavaScript function for ToolPkg runtime hooks.
+    /// Executes a named JavaScript function without an automatic completion deadline.
     fn execute_script_function(
         &self,
         script: &str,
@@ -387,10 +633,9 @@ pub trait JsExecutionEngine: Send + Sync {
         env_overrides: &BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatch_intermediate_on_main: bool,
-        timeout_sec: u64,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>>;
 
-    /// Executes a named JavaScript function with an exact millisecond timeout for ToolPkg runtime hooks.
+    /// Executes a before hook under its caller-owned millisecond completion deadline.
     fn execute_script_function_with_timeout_millis(
         &self,
         script: &str,
@@ -402,7 +647,7 @@ pub trait JsExecutionEngine: Send + Sync {
         timeout_millis: u64,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>>;
 
-    /// Executes a named JavaScript function without blocking the caller runtime.
+    /// Executes a named JavaScript function asynchronously without an automatic completion deadline.
     fn execute_script_function_async(
         &self,
         script: String,
@@ -411,7 +656,6 @@ pub trait JsExecutionEngine: Send + Sync {
         env_overrides: BTreeMap<String, String>,
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatch_intermediate_on_main: bool,
-        timeout_millis: u64,
     ) -> JsExecutionFuture<JsExecutionResult<Option<String>>>;
 
     /// Executes a ToolPkg registration function and returns captured declarations.
@@ -423,43 +667,25 @@ pub trait JsExecutionEngine: Send + Sync {
         text_resources: Option<Arc<BTreeMap<String, String>>>,
     ) -> JsExecutionResult<ToolPkgMainRegistrationCapture>;
 
-    /// Executes one Compose DSL render script with its immutable package text resources.
-    fn execute_compose_dsl_script(
-        &self,
-        script: &str,
-        runtime_options: &BTreeMap<String, Value>,
-        env_overrides: &BTreeMap<String, String>,
-        text_resources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>>;
-
-    /// Executes one Compose DSL render without blocking the caller runtime.
-    fn execute_compose_dsl_script_async(
+    /// Executes a streamed render with a synchronous sink for every generated retained commit.
+    fn execute_compose_dsl_script_stream_async(
         &self,
         script: String,
         runtime_options: BTreeMap<String, Value>,
         env_overrides: BTreeMap<String, String>,
         text_resources: Arc<BTreeMap<String, String>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>>;
-
-    /// Dispatches one Compose DSL action and emits intermediate render events.
-    fn dispatch_compose_dsl_action(
-        &self,
-        action_id: &str,
-        payload: Option<Value>,
-        runtime_options: &BTreeMap<String, Value>,
-        env_overrides: &BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>>;
+        on_response: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>>;
 
     /// Dispatches one Compose DSL action without blocking the caller runtime.
-    fn dispatch_compose_dsl_action_result_async(
+    fn dispatch_compose_dsl_action_stream_async(
         &self,
         action_id: String,
         payload: Option<Value>,
         runtime_options: BTreeMap<String, Value>,
         env_overrides: BTreeMap<String, String>,
-        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    ) -> JsExecutionFuture<JsExecutionResult<Option<String>>>;
+        on_intermediate_result: Arc<dyn Fn(operit_host_api::HostJavaScriptValue) + Send + Sync>,
+    ) -> JsExecutionFuture<JsExecutionResult<Option<Value>>>;
 
     /// Destroys any engine resources owned by this handle.
     fn destroy(&self);

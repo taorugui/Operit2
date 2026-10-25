@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:operit2/l10n/generated/app_localizations.dart';
 import 'style/MessageHeaderMetadata.dart';
 
+import '../../../../core/logging/ClientLogger.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../common/interactions/MessagePressShield.dart';
@@ -28,6 +29,7 @@ typedef MessageFavoriteAction =
 typedef MessageVoiceAction = Future<void> Function(ChatUiMessage message);
 
 class MessageContextMenu extends StatefulWidget {
+  /// Creates message actions with the owning chat's current execution state.
   const MessageContextMenu({
     super.key,
     required this.message,
@@ -44,6 +46,7 @@ class MessageContextMenu extends StatefulWidget {
     this.onRollbackToMessage,
     this.onSelectMessageToEdit,
     this.onRegenerateMessage,
+    this.isChatBusy = false,
     this.onInsertSummary,
     this.onCreateBranch,
     this.onReplyToMessage,
@@ -65,6 +68,7 @@ class MessageContextMenu extends StatefulWidget {
   final MessageTimestampSelectionAction? onRollbackToMessage;
   final MessageSelectionAction? onSelectMessageToEdit;
   final MessageTimestampAction? onRegenerateMessage;
+  final bool isChatBusy;
   final ValueChanged<ChatUiMessage>? onInsertSummary;
   final MessageTimestampAction? onCreateBranch;
   final ValueChanged<ChatUiMessage>? onReplyToMessage;
@@ -170,13 +174,15 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
     _longPressPointer = null;
   }
 
+  /// Positions the route menu in its owning Navigator overlay coordinates.
   Future<void> _showContextMenu() async {
     _cancelLongPress();
     final position = _menuPosition;
     if (position == null) {
       return;
     }
-    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final overlay =
+        Navigator.of(context).overlay!.context.findRenderObject()! as RenderBox;
     final localPosition = overlay.globalToLocal(position);
     final rect = RelativeRect.fromRect(
       localPosition & const Size(1, 1),
@@ -224,13 +230,6 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
       ),
     ];
     if (message.sender == 'user') {
-      items.add(
-        _menuItem(
-          value: _MessageMenuAction.queueMemory,
-          icon: Icons.psychology_outlined,
-          label: '加入记忆队列',
-        ),
-      );
       items.addAll(<PopupMenuEntry<_MessageMenuSelection>>[
         _menuItem(
           value: _MessageMenuAction.editAndResend,
@@ -250,6 +249,7 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
           value: _MessageMenuAction.regenerate,
           icon: Icons.refresh,
           label: '重新生成',
+          enabled: !widget.isChatBusy && widget.onRegenerateMessage != null,
         ),
         _menuItem(
           value: _MessageMenuAction.modifyMemory,
@@ -339,15 +339,26 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
     required _MessageMenuAction value,
     required IconData icon,
     required String label,
+    bool enabled = true,
   }) {
     return PopupMenuItem<_MessageMenuSelection>(
       value: _MessageMenuSelection.builtIn(value),
+      enabled: enabled,
       height: 36,
       child: Row(
         children: <Widget>[
-          Icon(icon, size: 16),
+          Icon(
+            icon,
+            size: 16,
+            color: enabled ? null : Theme.of(context).disabledColor,
+          ),
           const SizedBox(width: 12),
-          Text(label, style: Theme.of(context).textTheme.bodyMedium),
+          Text(
+            label,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: enabled ? null : Theme.of(context).disabledColor,
+            ),
+          ),
         ],
       ),
     );
@@ -373,26 +384,6 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
         );
         break;
       case _MessageMenuAction.editAndResend:
-        widget.onSelectMessageToEdit?.call(widget.message);
-        break;
-      case _MessageMenuAction.queueMemory:
-        try {
-          await widget.clients.chatRuntimeHolderMain
-              .enqueueSelectedMessagesForMemory(
-                chatId: widget.chatId,
-                messageTimestamps: [widget.message.timestamp],
-              );
-          if (mounted)
-            ScaffoldMessenger.of(
-              context,
-            ).showSnackBar(const SnackBar(content: Text('已加入所属记忆库队列')));
-        } catch (error) {
-          if (mounted)
-            ScaffoldMessenger.of(
-              context,
-            ).showSnackBar(SnackBar(content: Text('入队失败：$error')));
-        }
-        break;
       case _MessageMenuAction.modifyMemory:
         widget.onSelectMessageToEdit?.call(widget.message);
         break;
@@ -400,8 +391,23 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
         widget.onRollbackToMessage?.call(widget.message.timestamp);
         break;
       case _MessageMenuAction.regenerate:
-        await widget.onRegenerateMessage?.call(widget.message.timestamp);
-        await widget.onRefresh?.call();
+        if (widget.isChatBusy) return;
+        try {
+          await widget.onRegenerateMessage?.call(widget.message.timestamp);
+          await widget.onRefresh?.call();
+        } catch (error, stackTrace) {
+          ClientLogger.e(
+            'Failed to regenerate message',
+            tag: 'MessageContextMenu',
+            error: error,
+            stackTrace: stackTrace,
+          );
+          if (mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(error.toString())));
+          }
+        }
         break;
       case _MessageMenuAction.deleteVariant:
         await widget.onDeleteMessageVariant?.call(
@@ -603,7 +609,7 @@ class _MessageContextMenuState extends State<MessageContextMenu> {
                 if (message.roleName.isNotEmpty)
                   Text(
                     l10n?.chatMessageRole(message.roleName) ??
-                        '角色: ${message.roleName}',
+                        '回复者: ${message.roleName}',
                   ),
                 if (message.modelName.isNotEmpty)
                   Text(
@@ -673,7 +679,6 @@ enum _MessageMenuAction {
   copy,
   editAndResend,
   modifyMemory,
-  queueMemory,
   rollback,
   regenerate,
   deleteVariant,
@@ -714,7 +719,6 @@ Map<String, Object?> _toolPkgJsonObject(Object? value, String fieldName) {
 
 String cleanMessageContent(String content) {
   return content
-      .replaceAll(ChatMarkupRegex.memoryTag, '')
       .replaceAll(ChatMarkupRegex.workspaceAttachmentTag, '')
       .replaceAll(ChatMarkupRegex.attachmentTag, '')
       .replaceAll(ChatMarkupRegex.attachmentSelfClosingTag, '')

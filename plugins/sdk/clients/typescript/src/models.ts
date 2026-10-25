@@ -568,6 +568,8 @@ export interface ToolPkgContainerRuntime {
   readonly manifestExtensions: Record<string, unknown>;
   readonly author: Array<string>;
   readonly mainEntry: string;
+  readonly themes: Array<ToolPkgManifestTheme>;
+  readonly license: string | null;
   readonly sourceType: ToolPkgSourceType;
   readonly sourcePath: string;
   readonly subpackages: Array<ToolPkgSubpackageRuntime>;
@@ -587,8 +589,10 @@ export interface ToolPkgContainerRuntime {
   readonly chatInputHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatViewHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatMessageHooks: Array<ToolPkgFunctionHookRuntime>;
+  readonly chatLifecycleHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly chatMessageMenuItems: Array<ToolPkgChatMessageMenuItemRuntime>;
   readonly chatRuntimeHooks: Array<ToolPkgFunctionHookRuntime>;
+  readonly chatResponseHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly hostEventHooks: Array<ToolPkgHostEventHookRuntime>;
   readonly toolLifecycleHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly promptInputHooks: Array<ToolPkgFunctionHookRuntime>;
@@ -621,6 +625,8 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     manifestExtensions: input['manifestExtensions'] as Record<string, unknown>,
     author: (input['author'] as unknown[]).map((item) => item) as Array<string>,
     mainEntry: input['mainEntry'] as string,
+    themes: (input['themes'] as unknown[]).map((item) => decodeToolPkgManifestTheme(item)) as Array<ToolPkgManifestTheme>,
+    license: input['license'] == null ? null : input['license'] as string | null,
     sourceType: decodeToolPkgSourceType(input['sourceType']) as ToolPkgSourceType,
     sourcePath: input['sourcePath'] as string,
     subpackages: (input['subpackages'] as unknown[]).map((item) => decodeToolPkgSubpackageRuntime(item)) as Array<ToolPkgSubpackageRuntime>,
@@ -640,8 +646,10 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     chatInputHooks: (input['chatInputHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatViewHooks: (input['chatViewHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatMessageHooks: (input['chatMessageHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
+    chatLifecycleHooks: (input['chatLifecycleHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     chatMessageMenuItems: (input['chatMessageMenuItems'] as unknown[]).map((item) => decodeToolPkgChatMessageMenuItemRuntime(item)) as Array<ToolPkgChatMessageMenuItemRuntime>,
     chatRuntimeHooks: (input['chatRuntimeHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
+    chatResponseHooks: (input['chatResponseHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     hostEventHooks: (input['hostEventHooks'] as unknown[]).map((item) => decodeToolPkgHostEventHookRuntime(item)) as Array<ToolPkgHostEventHookRuntime>,
     toolLifecycleHooks: (input['toolLifecycleHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     promptInputHooks: (input['promptInputHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
@@ -675,6 +683,8 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'manifestExtensions': Object.fromEntries(Object.entries(value.manifestExtensions).map(([key, item]) => [key, item])),
     'author': value.author.map(item => item),
     'mainEntry': value.mainEntry,
+    'themes': value.themes.map(item => encodeToolPkgManifestTheme(item)),
+    'license': value.license === null ? null : value.license,
     'sourceType': encodeToolPkgSourceType(value.sourceType),
     'sourcePath': value.sourcePath,
     'subpackages': value.subpackages.map(item => encodeToolPkgSubpackageRuntime(item)),
@@ -694,8 +704,10 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'chatInputHooks': value.chatInputHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatViewHooks': value.chatViewHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatMessageHooks': value.chatMessageHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
+    'chatLifecycleHooks': value.chatLifecycleHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'chatMessageMenuItems': value.chatMessageMenuItems.map(item => encodeToolPkgChatMessageMenuItemRuntime(item)),
     'chatRuntimeHooks': value.chatRuntimeHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
+    'chatResponseHooks': value.chatResponseHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'hostEventHooks': value.hostEventHooks.map(item => encodeToolPkgHostEventHookRuntime(item)),
     'toolLifecycleHooks': value.toolLifecycleHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'promptInputHooks': value.promptInputHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
@@ -906,6 +918,33 @@ export function encodeToolPkgManifestRequirement(value: ToolPkgManifestRequireme
   };
 }
 
+export interface ToolPkgManifestTheme {
+  readonly id: string;
+  readonly path: string;
+  readonly preview: string;
+  readonly files: Array<ManifestFile>;
+}
+
+export function decodeToolPkgManifestTheme(value: unknown): ToolPkgManifestTheme {
+  const input = value as Record<string, unknown>;
+  return {
+    id: input['id'] as string,
+    path: input['path'] as string,
+    preview: input['preview'] as string,
+    files: (input['files'] as unknown[]).map((item) => decodeManifestFile(item)) as Array<ManifestFile>,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeToolPkgManifestTheme(value: ToolPkgManifestTheme): Record<string, unknown> {
+  return {
+    'id': value.id,
+    'path': value.path,
+    'preview': value.preview,
+    'files': value.files.map(item => encodeManifestFile(item)),
+  };
+}
+
 export interface ToolPkgMarketOrigin {
   readonly market: string;
   readonly toolpkgId: string;
@@ -957,6 +996,7 @@ export function encodeToolPkgNavigationActionHookRuntime(value: ToolPkgNavigatio
 export interface ToolPkgNavigationEntryRuntime {
   readonly id: string;
   readonly routeId: string;
+  readonly params: unknown;
   readonly surface: string;
   readonly title: LocalizedText;
   readonly action: ToolPkgNavigationActionHookRuntime | null;
@@ -969,6 +1009,7 @@ export function decodeToolPkgNavigationEntryRuntime(value: unknown): ToolPkgNavi
   return {
     id: input['id'] as string,
     routeId: input['routeId'] as string,
+    params: input['params'] as unknown,
     surface: input['surface'] as string,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     action: input['action'] == null ? null : decodeToolPkgNavigationActionHookRuntime(input['action']) as ToolPkgNavigationActionHookRuntime | null,
@@ -982,6 +1023,7 @@ export function encodeToolPkgNavigationEntryRuntime(value: ToolPkgNavigationEntr
   return {
     'id': value.id,
     'routeId': value.routeId,
+    'params': value.params,
     'surface': value.surface,
     'title': encodeLocalizedText(value.title),
     'action': value.action === null ? null : encodeToolPkgNavigationActionHookRuntime(value.action),
@@ -1138,6 +1180,7 @@ export interface ToolPkgUiModuleRuntime {
   readonly id: string;
   readonly runtime: string;
   readonly screen: string;
+  readonly screenExport: string | null;
   readonly title: LocalizedText;
   readonly keepAlive: boolean;
 }
@@ -1148,6 +1191,7 @@ export function decodeToolPkgUiModuleRuntime(value: unknown): ToolPkgUiModuleRun
     id: input['id'] as string,
     runtime: input['runtime'] as string,
     screen: input['screen'] as string,
+    screenExport: input['screenExport'] == null ? null : input['screenExport'] as string | null,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     keepAlive: input['keepAlive'] as boolean,
   };
@@ -1159,6 +1203,7 @@ export function encodeToolPkgUiModuleRuntime(value: ToolPkgUiModuleRuntime): Rec
     'id': value.id,
     'runtime': value.runtime,
     'screen': value.screen,
+    'screenExport': value.screenExport === null ? null : value.screenExport,
     'title': encodeLocalizedText(value.title),
     'keepAlive': value.keepAlive,
   };
@@ -1169,6 +1214,7 @@ export interface ToolPkgUiRouteRuntime {
   readonly routeId: string;
   readonly runtime: string;
   readonly screen: string;
+  readonly screenExport: string | null;
   readonly title: LocalizedText;
   readonly keepAlive: boolean;
 }
@@ -1180,6 +1226,7 @@ export function decodeToolPkgUiRouteRuntime(value: unknown): ToolPkgUiRouteRunti
     routeId: input['routeId'] as string,
     runtime: input['runtime'] as string,
     screen: input['screen'] as string,
+    screenExport: input['screenExport'] == null ? null : input['screenExport'] as string | null,
     title: decodeLocalizedText(input['title']) as LocalizedText,
     keepAlive: input['keepAlive'] as boolean,
   };
@@ -1192,6 +1239,7 @@ export function encodeToolPkgUiRouteRuntime(value: ToolPkgUiRouteRuntime): Recor
     'routeId': value.routeId,
     'runtime': value.runtime,
     'screen': value.screen,
+    'screenExport': value.screenExport === null ? null : value.screenExport,
     'title': encodeLocalizedText(value.title),
     'keepAlive': value.keepAlive,
   };
@@ -1281,6 +1329,27 @@ export function encodeToolPkgWorkspaceTemplateRuntime(value: ToolPkgWorkspaceTem
     'description': encodeLocalizedText(value.description),
     'resource_key': value.resource_key,
     'project_type': value.project_type,
+  };
+}
+
+export interface ManifestFile {
+  readonly path: string;
+  readonly media_type: string;
+}
+
+export function decodeManifestFile(value: unknown): ManifestFile {
+  const input = value as Record<string, unknown>;
+  return {
+    path: input['path'] as string,
+    media_type: input['mediaType'] as string,
+  };
+}
+
+/** Encodes a typed SDK model into its Link argument representation. */
+export function encodeManifestFile(value: ManifestFile): Record<string, unknown> {
+  return {
+    'path': value.path,
+    'mediaType': value.media_type,
   };
 }
 

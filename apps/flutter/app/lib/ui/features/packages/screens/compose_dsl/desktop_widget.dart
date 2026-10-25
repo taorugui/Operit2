@@ -16,7 +16,7 @@ class ToolPkgDesktopWidgetFrame {
     required String instanceId,
     required bool useEnglish,
   }) async {
-    final raw = await clients.application
+    final snapshot = await clients.application
         .packageManager()
         .renderToolPkgDesktopWidget(
           containerPackageName: definition.containerPackageName,
@@ -24,12 +24,10 @@ class ToolPkgDesktopWidgetFrame {
           instanceId: instanceId,
           useEnglish: useEnglish,
         );
-    final snapshot = (jsonDecode(raw) as Map).cast<String, Object?>();
+    final store = _ComposeProgramStore()..apply(snapshot.renderUpdate);
     return ToolPkgDesktopWidgetFrame._(
-      core_proxy.ToolPkgDesktopWidget.fromJson(
-        (snapshot['widget'] as Map).cast<String, Object?>(),
-      ),
-      _ComposeDslRenderResult.parse(jsonEncode(snapshot['renderResult'])),
+      snapshot.widget,
+      _ComposeDslRenderResult(tree: store.root, actionResult: null),
     );
   }
 
@@ -52,12 +50,14 @@ class ToolPkgDesktopWidgetFrame {
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: () => openRoute('open'),
-          child: _ComposeDslRenderer(
+          child: _ComposeProgramExecutor(
             node: _render.tree,
             nodePath: 'desktop-widget:$instanceId',
+            dispatchOnLoad: false,
             onAction: openRoute,
             onTextInput: openRoute,
             webViewHostContext: ComposeDslWebViewHostContext(
+              clients: clients,
               packageName: definition.containerPackageName,
               routeInstanceId: instanceId,
               executionContextKey: 'desktop-widget:$instanceId',

@@ -3,6 +3,7 @@
 import 'dart:async';
 import 'dart:collection';
 
+import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -36,7 +37,8 @@ class ChatArea extends StatefulWidget {
     required this.errorMessage,
     required this.scrollController,
     required this.currentChatId,
-    required this.currentCharacterCardAvatarUri,
+    required this.identityAvatarUri,
+    this.onIdentityTap,
     required this.clients,
     required this.packageManager,
     required this.autoScrollToBottomListenable,
@@ -75,7 +77,8 @@ class ChatArea extends StatefulWidget {
   final String? errorMessage;
   final ScrollController scrollController;
   final String? currentChatId;
-  final String? currentCharacterCardAvatarUri;
+  final String? identityAvatarUri;
+  final VoidCallback? onIdentityTap;
   final GeneratedCoreProxyClients clients;
   final GeneratedApplicationPackageManagerCoreProxy packageManager;
   final ValueListenable<bool> autoScrollToBottomListenable;
@@ -126,6 +129,7 @@ class _ChatAreaState extends State<ChatArea>
   );
   final Map<int, _CachedMessageRow> _messageRowCache =
       <int, _CachedMessageRow>{};
+  late final ValueNotifier<bool> _chatBusyNotifier;
   Timer? _navigatorHideTimer;
   Timer? _viewportResizeTimer;
   bool _userScrollSessionActive = false;
@@ -137,7 +141,10 @@ class _ChatAreaState extends State<ChatArea>
     0,
   );
   double _scrollViewportDimension = 0;
-  final Stopwatch _bottomFollowClock = Stopwatch();
+
+  /// Uses the scheduler timeline shared by layout, animation and test frames.
+  int get _bottomFollowNowMicroseconds =>
+      SchedulerBinding.instance.currentSystemFrameTimeStamp.inMicroseconds;
   final Queue<_BottomGrowthSample> _bottomGrowthSamples =
       Queue<_BottomGrowthSample>();
   late final Ticker _bottomFollowTicker;
@@ -155,12 +162,12 @@ class _ChatAreaState extends State<ChatArea>
   @override
   void initState() {
     super.initState();
+    _chatBusyNotifier = ValueNotifier<bool>(widget.isLoading);
     _layoutScrollController = _ChatLayoutScrollController(
       delegate: widget.scrollController,
       shouldAlignBottom: _shouldAlignBottomDuringLayout,
       shouldInitiallyAlignBottom: _ownsBottomScroll,
     );
-    _bottomFollowClock.start();
     _bottomFollowTicker = createTicker(_tickBottomFollow);
   }
 
@@ -499,8 +506,7 @@ class _ChatAreaState extends State<ChatArea>
     _clearPendingMessageJump();
     _activeUserScrollPointers.add(event.pointer);
     if (_bottomFollowTicker.isActive) {
-      _bottomFollowLastFrameMicroseconds =
-          _bottomFollowClock.elapsedMicroseconds;
+      _bottomFollowLastFrameMicroseconds = _bottomFollowNowMicroseconds;
     }
   }
 
@@ -509,14 +515,12 @@ class _ChatAreaState extends State<ChatArea>
     _activeUserScrollPointers.remove(event.pointer);
     if (_activeUserScrollPointers.isNotEmpty) {
       if (_bottomFollowTicker.isActive) {
-        _bottomFollowLastFrameMicroseconds =
-            _bottomFollowClock.elapsedMicroseconds;
+        _bottomFollowLastFrameMicroseconds = _bottomFollowNowMicroseconds;
       }
       return;
     }
     if (_bottomFollowTicker.isActive) {
-      _bottomFollowLastFrameMicroseconds =
-          _bottomFollowClock.elapsedMicroseconds;
+      _bottomFollowLastFrameMicroseconds = _bottomFollowNowMicroseconds;
       return;
     }
     if (!widget.autoScrollToBottomListenable.value) {
@@ -589,7 +593,7 @@ class _ChatAreaState extends State<ChatArea>
 
   /// Records measured live growth and starts the frame-driven bottom follower.
   void _scheduleBottomFollow(double heightDelta) {
-    final nowMicroseconds = _bottomFollowClock.elapsedMicroseconds;
+    final nowMicroseconds = _bottomFollowNowMicroseconds;
     if (!mounted ||
         !_shouldRunBottomFollow() ||
         !widget.autoScrollToBottomListenable.value ||
@@ -615,7 +619,7 @@ class _ChatAreaState extends State<ChatArea>
 
   /// Advances the scroll position from recent output growth and baseline error.
   void _tickBottomFollow(Duration elapsed) {
-    final nowMicroseconds = _bottomFollowClock.elapsedMicroseconds;
+    final nowMicroseconds = _bottomFollowNowMicroseconds;
     if (!mounted ||
         !_shouldRunBottomFollow() ||
         !widget.autoScrollToBottomListenable.value ||
@@ -711,7 +715,7 @@ class _ChatAreaState extends State<ChatArea>
         !widget.scrollController.hasClients) {
       return;
     }
-    final nowMicroseconds = _bottomFollowClock.elapsedMicroseconds;
+    final nowMicroseconds = _bottomFollowNowMicroseconds;
     _bottomFollowCompleting = true;
     if (!_bottomFollowTicker.isActive) {
       _bottomFollowLastFrameMicroseconds = nowMicroseconds;
@@ -874,6 +878,7 @@ class _ChatAreaState extends State<ChatArea>
   @override
   void didUpdateWidget(ChatArea oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _chatBusyNotifier.value = widget.isLoading;
     _layoutScrollController.delegate = widget.scrollController;
     final chatChanged = oldWidget.currentChatId != widget.currentChatId;
     if (chatChanged) {
@@ -954,17 +959,18 @@ class _ChatAreaState extends State<ChatArea>
     _viewportResizeTimer?.cancel();
     _layoutScrollController.dispose();
     _bottomFollowTicker.dispose();
-    _bottomFollowClock.stop();
     _bottomGrowthSamples.clear();
     _messageAnchorsNotifier.dispose();
     _viewportHeightNotifier.dispose();
     _showNavigatorChipNotifier.dispose();
+    _chatBusyNotifier.dispose();
     _messageKeys.clear();
     _messageRowCache.clear();
     _disposeRowExtents();
     super.dispose();
   }
 
+  /// Reuses transcript content while each menu observes current chat activity.
   Widget _messageRowFor(int messageIndex, ChatUiMessage message) {
     final selected = widget.selectedMessageTimestamps.contains(
       message.timestamp,
@@ -986,8 +992,9 @@ class _ChatAreaState extends State<ChatArea>
         cached.selected == selected &&
         cached.selectionMode == selectionMode &&
         cached.isStreaming == isStreaming &&
-        cached.currentCharacterCardAvatarUri ==
-            widget.currentCharacterCardAvatarUri &&
+        cached.onIdentityTap == widget.onIdentityTap &&
+        cached.chatId == widget.currentChatId &&
+        cached.identityAvatarUri == widget.identityAvatarUri &&
         cached.themePreferenceSnapshot == themePreferenceSnapshot &&
         cached.messageThemeColors == messageThemeColors &&
         _sameMessageForRender(cached.message, message);
@@ -1000,10 +1007,11 @@ class _ChatAreaState extends State<ChatArea>
       colorScheme: colorScheme,
       key: ValueKey<String>(_messageWidgetKey(message)),
       message: message,
-      currentCharacterCardAvatarUri: widget.currentCharacterCardAvatarUri,
+      onIdentityTap: widget.onIdentityTap,
       splitMarkdownContent: widget.splitMarkdownContent,
       onDeleteMessage: widget.onDeleteMessage,
       onEditSummary: widget.onSelectMessageToEdit,
+      enableDialogs: !selectionMode,
     );
     final messageContent = _SelectableMessageFrame(
       selected: selected,
@@ -1028,28 +1036,33 @@ class _ChatAreaState extends State<ChatArea>
           )
         : widget.currentChatId == null
         ? messageContent
-        : MessageContextMenu(
-            key: ValueKey<String>('menu-${_messageWidgetKey(message)}'),
-            message: message,
-            chatId: widget.currentChatId!,
-            messageIndex: messageIndex,
-            clients: widget.clients,
-            packageManager: widget.packageManager,
-            onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
-            onDeleteMessage: widget.onDeleteMessage,
-            onDeleteMessagesFrom: widget.onDeleteMessagesFrom,
-            onDeleteMessageVariant: widget.onDeleteMessageVariant,
-            onRollbackToMessage: widget.onRollbackToMessage,
-            onSelectMessageToEdit: widget.onSelectMessageToEdit,
-            onRegenerateMessage: widget.onRegenerateMessage,
-            onInsertSummary: widget.onInsertSummary,
-            onCreateBranch: widget.onCreateBranch,
-            onReplyToMessage: widget.onReplyToMessage,
-            onPlayVoice: widget.onPlayVoice,
-            onToggleMultiSelectMode: widget.onToggleMultiSelectMode,
-            onRefresh: widget.onRefreshRequested,
-            splitMarkdownContent: widget.splitMarkdownContent,
+        : ValueListenableBuilder<bool>(
+            valueListenable: _chatBusyNotifier,
             child: messageContent,
+            builder: (context, isChatBusy, child) => MessageContextMenu(
+              key: ValueKey<String>('menu-${_messageWidgetKey(message)}'),
+              message: message,
+              chatId: widget.currentChatId!,
+              messageIndex: messageIndex,
+              clients: widget.clients,
+              packageManager: widget.packageManager,
+              onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
+              onDeleteMessage: widget.onDeleteMessage,
+              onDeleteMessagesFrom: widget.onDeleteMessagesFrom,
+              onDeleteMessageVariant: widget.onDeleteMessageVariant,
+              onRollbackToMessage: widget.onRollbackToMessage,
+              onSelectMessageToEdit: widget.onSelectMessageToEdit,
+              onRegenerateMessage: widget.onRegenerateMessage,
+              isChatBusy: isChatBusy,
+              onInsertSummary: widget.onInsertSummary,
+              onCreateBranch: widget.onCreateBranch,
+              onReplyToMessage: widget.onReplyToMessage,
+              onPlayVoice: widget.onPlayVoice,
+              onToggleMultiSelectMode: widget.onToggleMultiSelectMode,
+              onRefresh: widget.onRefreshRequested,
+              splitMarkdownContent: widget.splitMarkdownContent,
+              child: child!,
+            ),
           );
     _messageRowCache[message.timestamp] = _CachedMessageRow(
       index: messageIndex,
@@ -1057,9 +1070,11 @@ class _ChatAreaState extends State<ChatArea>
       selected: selected,
       selectionMode: selectionMode,
       isStreaming: isStreaming,
-      currentCharacterCardAvatarUri: widget.currentCharacterCardAvatarUri,
+      identityAvatarUri: widget.identityAvatarUri,
+      onIdentityTap: widget.onIdentityTap,
       themePreferenceSnapshot: themePreferenceSnapshot,
       messageThemeColors: messageThemeColors,
+      chatId: widget.currentChatId,
       widget: row,
     );
     return row;
@@ -1119,30 +1134,53 @@ class _ChatLayoutScrollController extends ScrollController {
   ScrollController _delegate;
   final ValueGetter<bool> shouldAlignBottom;
   final ValueGetter<bool> shouldInitiallyAlignBottom;
+  ScrollPosition? _origin;
 
-  /// Transfers attached positions when the owner replaces its controller.
+  /// Moves the active layout origin when the owner replaces its controller.
   set delegate(ScrollController value) {
     if (identical(value, _delegate)) {
       return;
     }
-    for (final position in positions) {
-      _delegate.detach(position);
-      value.attach(position);
-    }
+    final origin = _origin;
+    final previous = _delegate;
     _delegate = value;
+    if (origin == null) {
+      return;
+    }
+    previous.detach(origin);
+    value.attach(origin);
   }
 
-  /// Exposes the same position to the owner's navigation and scroll listeners.
+  /// The active layout origin. A replaced viewport stays registered until it
+  /// unmounts, so [positions] can briefly contain that deactivated origin.
+  @override
+  ScrollPosition get position {
+    final origin = _origin;
+    if (origin == null) {
+      throw StateError('ScrollController not attached to any scroll views.');
+    }
+    return origin;
+  }
+
+  /// Registers a new layout origin and publishes only that origin to the owner.
   @override
   void attach(ScrollPosition position) {
     super.attach(position);
+    final previous = _origin;
+    _origin = position;
+    if (previous != null) {
+      _delegate.detach(previous);
+    }
     _delegate.attach(position);
   }
 
-  /// Releases the position from both controllers when a viewport is replaced.
+  /// Releases a viewport position. Only the active origin is on the owner.
   @override
   void detach(ScrollPosition position) {
-    _delegate.detach(position);
+    if (identical(position, _origin)) {
+      _delegate.detach(position);
+      _origin = null;
+    }
     super.detach(position);
   }
 
@@ -1382,15 +1420,18 @@ class _SelectableMessageFrame extends StatelessWidget {
 }
 
 class _CachedMessageRow {
+  /// Records the message and rendering state represented by one retained row.
   const _CachedMessageRow({
     required this.index,
     required this.message,
     required this.selected,
     required this.selectionMode,
     required this.isStreaming,
-    required this.currentCharacterCardAvatarUri,
+    required this.identityAvatarUri,
+    this.onIdentityTap,
     required this.themePreferenceSnapshot,
     required this.messageThemeColors,
+    required this.chatId,
     required this.widget,
   });
 
@@ -1399,16 +1440,22 @@ class _CachedMessageRow {
   final bool selected;
   final bool selectionMode;
   final bool isStreaming;
-  final String? currentCharacterCardAvatarUri;
+  final String? identityAvatarUri;
+  final VoidCallback? onIdentityTap;
   final ThemePreferenceSnapshot themePreferenceSnapshot;
   final ChatMessageThemeColors messageThemeColors;
+  final String? chatId;
   final Widget widget;
 }
 
 /// Reports whether one cached message row can be reused unchanged.
 bool _sameMessageForRender(ChatUiMessage left, ChatUiMessage right) {
   final contentStreamSame = identical(left.contentStream, right.contentStream);
-  return left.sender == right.sender &&
+  return const DeepCollectionEquality().equals(
+        left.pluginExtensions,
+        right.pluginExtensions,
+      ) &&
+      left.sender == right.sender &&
       (_sameMessagePartsForRender(left, right) ||
           _sameLiveAiStreamForRender(left, right, contentStreamSame)) &&
       left.timestamp == right.timestamp &&

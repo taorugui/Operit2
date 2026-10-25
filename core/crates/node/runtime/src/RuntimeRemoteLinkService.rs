@@ -3,7 +3,7 @@ use operit_host_api::TimeUtils::currentTimeMillis;
 use operit_link::protocol::LinkDeviceInfo;
 use operit_link::{fromCoreValue, toCoreValue, CoreCallRequest, CoreValue, CORE_INTERNAL_TARGET};
 use operit_store::CoreNodeBindingStore::CoreNodeBindingStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::{
     NetworkControlAuditRecord, NetworkControlIdentityAssignment, NetworkControlRole,
     NetworkControlState, NetworkControlStore,
@@ -27,8 +27,16 @@ use crate::{
 // The same admission state machine is used by full Core and lightweight Edge.
 pub use crate::NodeSpaceService::{SpaceJoinRequest, SpaceJoinStatus};
 pub(crate) use crate::NodeSpaceService::PeerSpaceSnapshot;
-pub(crate) use crate::NodeSpaceService::{NODE_SPACE_TARGET, NODE_SPACE_APPROVAL_TARGET, space_reconcile};
+pub(crate) use crate::NodeSpaceService::{
+    NODE_SPACE_TARGET, NODE_SPACE_APPROVAL_TARGET, NODE_SPACE_CONTROL_TARGET,
+};
 use crate::NodeSpaceService::space_join;
+
+/// One delivery attempt per removal notice; the removal never blocks on it.
+const REMOVAL_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Total budget for the whole notice phase; partial delivery stays best-effort.
+const REMOVAL_NOTICES_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// 已配对设备的展示投影；不暴露底层会话、端点或传输选择。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePairedDevice {
@@ -57,6 +65,12 @@ pub struct RuntimeDeviceSpaceDevice {
     pub model: String,
     pub coreVersion: Option<String>,
     pub online: bool,
+    /// Peer Links one routed request traverses; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayHops: Option<u32>,
+    /// Hop node ids from the first hop through the member; reported only for multi-hop members.
+    #[serde(default)]
+    pub relayPath: Option<Vec<String>>,
     pub currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 }
 
@@ -73,6 +87,8 @@ pub enum RuntimeDeviceSpaceConnectionStatus {
     Online,
     Offline,
     VersionMismatch,
+    /// Announced by its owning device; the local device cannot observe the link directly.
+    Announced,
     Unknown,
 }
 
@@ -148,11 +164,23 @@ impl RuntimeRemoteLinkService {
     pub async fn discoverPeers(&self, timeoutMs: u64) -> Result<Vec<crate::NodeServices::DiscoveredPeer>, String> {
         self.nodeServices()?.peers().discoverPeers(timeoutMs).await.map_err(|error| error.to_string())
     }
+    /// Updates the local outbound pairing endpoint and probes the device through its sole channel.
+    #[allow(non_snake_case)]
+    pub async fn updatePairedDeviceEndpoint(
+        &self,
+        deviceId: String,
+        endpoint: String,
+        transport: Option<operit_peer_link::PeerTransport>,
+    ) -> Result<(), String> {
+        self.nodeServices()?.peers().updatePeerEndpoint(&deviceId, &endpoint, transport)
+            .await.map_err(|error| error.to_string())
+    }
+    /// Creates pending pairing for subsequent code confirmation.
     pub async fn startPairing(&self, nodeId: String, address: String,
-        transport: operit_peer_link::PeerTransport, token: Option<String>,
+        transport: Option<operit_peer_link::PeerTransport>,
     ) -> Result<crate::NodeServices::PendingPairing, String> {
         self.nodeServices()?.peers().startPairing(crate::NodeServices::PeerEndpoint { nodeId, address },
-            transport, token.as_deref()).await.map_err(|error| error.to_string())
+            transport).await.map_err(|error| error.to_string())
     }
     pub async fn finishPairing(&self, pairingId: String, confirmationCode: String)
         -> Result<crate::NodeServices::PairedPeer, String> {
@@ -180,21 +208,12 @@ impl RuntimeRemoteLinkService {
     pub async fn stopListening(&self) -> Result<(), String> {
         self.nodeServices()?.peers().stop().await.map_err(|error| error.to_string())
     }
-    /// 本机配置继续读取原路径；不生成另一份 token 或监听配置。
+    /// Reads node-local listener preferences from their existing storage path.
     pub fn localHostConfig(&self) -> Result<Option<crate::PeerStateStore::PeerHostConfig>, String> {
         crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost()).hostConfig()
     }
     pub fn saveLocalHostConfig(&self, config: crate::PeerStateStore::PeerHostConfig) -> Result<(), String> {
         crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost()).saveHostConfig(&config)
-    }
-    /// 仅本机用户显式查看/复制，远端路由不允许调用。
-    pub fn localPairingToken(&self) -> Result<String, String> {
-        crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost()).localPairingToken()
-    }
-    /// Rotates the node-local listener credential through its preference transaction.
-    pub fn refreshLocalPairingToken(&self) -> Result<String, String> {
-        crate::PeerStateStore::PeerStateStore::new(self.localRuntime.runtimeStorageHost())
-            .refreshLocalPairingToken()
     }
     /// 复用原身份文件并刷新 Space 资料；通信会话不参与设备资料初始化。
     pub fn initializeDeviceInfo(&self, supplied: LinkDeviceInfo) -> Result<LinkDeviceInfo, String> {
@@ -214,7 +233,8 @@ impl RuntimeRemoteLinkService {
 
     fn writeDeviceProfile(&self, info: &LinkDeviceInfo) -> Result<(), String> {
         self.spaceStore.writeLocalDeviceProfile(info.displayName(), info.platform.clone(),
-            info.model.clone(), operit_runtime::CORE_VERSION.to_string()).map(|_| ())
+            info.model.clone(), operit_runtime::CORE_VERSION.to_string(),
+            info.pairingIncarnation.clone()).map(|_| ())
     }
 
     /// Returns the converged Space membership owned by this CoreNode.
@@ -288,6 +308,24 @@ impl RuntimeRemoteLinkService {
         Ok(overview)
     }
 
+    /// Reads only this device's bounded configuration, never a business replica.
+    pub fn devicePreferences(&self, nodeId: String) -> Result<BTreeMap<String, serde_json::Value>, String> {
+        let space = self.spaceStore.space()?;
+        if !space.members.contains(&nodeId) { return Err("Device is not a Space member".into()); }
+        operit_store::DevicePreferencesStore::DevicePreferencesStore::new(self.localRuntime.runtimeStorageHost())
+            .read(&space.spaceId, &nodeId).map(|state| state.values())
+    }
+
+    /// Local configuration editors can configure a member without granting storage.
+    pub fn setDevicePreference(&self, nodeId: String, key: String, value: Option<serde_json::Value>) -> Result<(), String> {
+        let space = self.spaceStore.space()?;
+        if !space.members.contains(&nodeId) || self.networkControlStore.nodeIsDisconnected(&nodeId)? {
+            return Err("Device is not an active Space member".into());
+        }
+        operit_store::DevicePreferencesStore::DevicePreferencesStore::new(self.localRuntime.runtimeStorageHost())
+            .set(&space.spaceId, &nodeId, &self.nodeRouter.localNodeId(), &key, value).map(|_| ())
+    }
+
     /// Creates the initial administrator policy for this device's new single-device Space.
     #[allow(non_snake_case)]
     pub fn bootstrapDeviceSpaceControl(&self) -> Result<NetworkControlState, String> {
@@ -317,6 +355,18 @@ impl RuntimeRemoteLinkService {
     #[allow(non_snake_case)]
     pub fn defineDeviceSpaceRole(&self, role: NetworkControlRole) -> Result<(), String> {
         self.networkControlStore.defineRole(role).map(|_| ())
+    }
+
+    /// Updates one existing custom role from named capabilities.
+    #[allow(non_snake_case)]
+    pub fn updateDeviceSpaceRole(&self, role: NetworkControlRole) -> Result<(), String> {
+        self.networkControlStore.updateRole(role).map(|_| ())
+    }
+
+    /// Removes one custom role; devices holding it fall back to the default user identity.
+    #[allow(non_snake_case)]
+    pub fn removeDeviceSpaceRole(&self, roleId: String) -> Result<(), String> {
+        self.networkControlStore.removeRole(roleId).map(|_| ())
     }
 
     /// Sets one existing identity as the device's current identity.
@@ -355,13 +405,132 @@ impl RuntimeRemoteLinkService {
     /// every local pairing credential is removed while its live Peer Link ends.
     /// The device returns to stranger state — reconnecting requires a fresh
     /// pairing plus a new join approval.
+    ///
+    /// Before the local erase completes, one best-effort removal notice goes to
+    /// the removed device and to every device this removal cuts off, so a
+    /// bridge's far side learns the removal instead of staying in a stale view.
     #[allow(non_snake_case)]
     pub async fn removeDeviceSpaceMember(&self, deviceId: String) -> Result<(), String> {
+        // Links and routes are captured before the policy change: removing one
+        // device can cut devices that were only reachable through it, and the
+        // notice needs the first hop that still reaches them.
+        let notices = self.captureRemovalNotices()?;
         self.networkControlStore.removeMember(deviceId.clone())?;
+        if tokio::time::timeout(
+            REMOVAL_NOTICES_BUDGET,
+            self.deliverRemovalNotices(&deviceId, notices),
+        )
+        .await
+        .is_err()
+        {
+            operit_util::AppLogger::AppLogger::w(
+                "RuntimeRemoteLinkService",
+                &format!("Removal notice phase exhausted its budget removed={deviceId}"),
+            );
+        }
         self.spaceStore.removeRemoteMember(deviceId.clone())?;
         space_join::purgeDevice(self, &deviceId)?;
         self.nodeServices()?.peers().removePairedPeer(&deviceId).await
             .map_err(|error| error.to_string())
+    }
+
+    /// Captures the first hop that currently reaches every other member.
+    fn captureRemovalNotices(&self) -> Result<Vec<(String, String)>, String> {
+        let mut notices = Vec::new();
+        for nodeId in self.spaceStore.space()?.members {
+            if nodeId == self.nodeRouter.localNodeId() { continue; }
+            if let Some(plan) = self.nodeRouter.nodeRoutePlan(&nodeId)? {
+                notices.push((nodeId, plan.firstHop().to_string()));
+            }
+        }
+        Ok(notices)
+    }
+
+    /// Delivers one best-effort control exchange along the captured route. The
+    /// notice carries the ordinary control log, so the receiving side
+    /// replay-validates it exactly like a normal synchronization and never
+    /// acts on a bare claim. Failures never block the removal.
+    async fn deliverRemovalNotices(&self, removedNodeId: &str, notices: Vec<(String, String)>) {
+        let operations = match self.networkControlStore.currentSpaceOperations() {
+            Ok(operations) => operations,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice skipped removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        let args = match toCoreValue(operations) {
+            Ok(args) => args,
+            Err(error) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice encoding failed removed={removedNodeId} error={error}"),
+                );
+                return;
+            }
+        };
+        for (nodeId, firstHop) in &notices {
+            // Members that stay reachable keep learning through the normal
+            // synchronization loop; only the cut-off devices need this push.
+            if nodeId != removedNodeId
+                && self.nodeRouter.nodeIsReachable(nodeId).unwrap_or(false)
+            {
+                continue;
+            }
+            // The removed device is notified last: its own notice retires it,
+            // and a retired bridge would reject the exchange it must still
+            // forward for the far side.
+            if nodeId == removedNodeId { continue; }
+            self.deliverRemovalNotice(nodeId, firstHop, &args).await;
+        }
+        if let Some((nodeId, firstHop)) = notices
+            .iter()
+            .find(|(nodeId, _)| nodeId == removedNodeId)
+            .cloned()
+        {
+            self.deliverRemovalNotice(&nodeId, &firstHop, &args).await;
+        }
+    }
+
+    /// Delivers one removal notice along the captured first hop.
+    async fn deliverRemovalNotice(&self, nodeId: &str, firstHop: &str, args: &CoreValue) {
+        let request = CoreCallRequest::new(
+            operit_link::nextCoreRouteRequestId("space-removal-notice"),
+            NODE_SPACE_CONTROL_TARGET,
+            "exchange",
+            args.clone(),
+        );
+        let delivery = self
+            .nodeRouter
+            .sendSpaceEnvelopeAlongHop(firstHop, nodeId, request);
+        match tokio::time::timeout(REMOVAL_NOTICE_TIMEOUT, delivery).await {
+            Ok(response) if response.result.is_ok() => {}
+            Ok(response) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!(
+                        "Removal notice rejected target={nodeId} hop={firstHop} error={:?}",
+                        response.result.err()
+                    ),
+                );
+            }
+            Err(_) => {
+                operit_util::AppLogger::AppLogger::w(
+                    "RuntimeRemoteLinkService",
+                    &format!("Removal notice timed out target={nodeId} hop={firstHop}"),
+                );
+            }
+        }
+    }
+
+    /// Retires this device once the shared policy removed it, dropping every
+    /// pairing it held at that moment. The removal forgets immediately: a
+    /// deferred delete cannot tell those pairings from ones created later by
+    /// pairing again for re-admission.
+    pub(crate) async fn retireRemovedDevice(&self) -> Result<bool, String> {
+        Ok(space_join::retireRemovedLocalDevice(self, None)?.is_some())
     }
 
     /// Prohibits one device from direct connection and route transit immediately.
@@ -390,11 +559,16 @@ impl RuntimeRemoteLinkService {
                 let profile = profiles.get(&deviceId).ok_or_else(|| {
                     format!("Device profile is missing in the current device space: {deviceId}")
                 })?;
-                let online =
-                    deviceId == currentDeviceId || self.nodeRouter.nodeIsReachable(&deviceId)?;
+                let routePlan = if deviceId == currentDeviceId {
+                    None
+                } else {
+                    self.nodeRouter.nodeRoutePlan(&deviceId)?
+                };
+                let online = deviceId == currentDeviceId || routePlan.is_some();
                 Ok(runtimeDeviceSpaceDevice(
                     profile,
                     online,
+                    routePlan.as_ref(),
                     runtimeDeviceSpaceIdentity(&controlState, &deviceId),
                 ))
             })
@@ -455,6 +629,7 @@ impl RuntimeRemoteLinkService {
         Ok(runtimeDeviceSpaceDevice(
             &profile,
             true,
+            None,
             runtimeDeviceSpaceIdentity(&controlState, &profile.nodeId),
         ))
     }
@@ -527,14 +702,7 @@ impl RuntimeRemoteLinkService {
 
     /// Captures member profiles and control history for direct Space propagation.
     pub(crate) fn peerSpaceSnapshot(&self) -> Result<PeerSpaceSnapshot, String> {
-        let snapshot = PeerSpaceSnapshot {
-            space: self.deviceSpace()?,
-            deviceProfiles: self.spaceStore.deviceProfiles()?.into_values().collect(),
-            controlOperations: self.networkControlStore.currentSpaceOperations()?,
-            topology: self.spaceStore.topologyRecords()?.into_values().collect(),
-        };
-        CoreSpaceStore::validateSpaceProfiles(&snapshot.space, &snapshot.deviceProfiles)?;
-        Ok(snapshot)
+        crate::NodeSpaceService::peerSpaceSnapshot(self)
     }
 
     /// Applies a complete peer projection, following only an approved cross-Space merge.
@@ -546,24 +714,7 @@ impl RuntimeRemoteLinkService {
     pub(crate) fn acceptPeerSpaceCall(
         &self, peerNodeId: &str, request: CoreCallRequest,
     ) -> Result<CoreValue, String> {
-        match request.methodName.as_str() {
-            "snapshot" => toCoreValue(self.peerSpaceSnapshot()?).map_err(|error| error.to_string()),
-            "observeSpaceSnapshot" => {
-                let snapshot: PeerSpaceSnapshot = fromCoreValue(request.args).map_err(|error| error.to_string())?;
-                toCoreValue(self.observePeerSpaceSnapshot(peerNodeId, snapshot)?)
-                    .map_err(|error| error.to_string())
-            },
-            "deviceSpace" => toCoreValue(self.deviceSpace()?).map_err(|error| error.to_string()),
-            "observePairedDeviceSpace" => {
-                let space: CoreSpace = fromCoreValue(request.args).map_err(|error| error.to_string())?;
-                toCoreValue(self.spaceStore.observePairedDeviceSpace(peerNodeId.to_string(), space)?)
-                    .map_err(|error| error.to_string())
-            },
-            "requestJoin" | "joinStatus" | "cancelJoin" => space_join::receive(self, peerNodeId, request),
-            "reconcileSharedSpace" => space_reconcile::receive(self, peerNodeId, request),
-            "join" => Err("SPACE_JOIN_APPROVAL_REQUIRED: Submit a join request for local approval first".into()),
-            _ => Err("Unknown node Space method".into()),
-        }
+        crate::NodeSpaceService::dispatchPeerSpaceCall(self, peerNodeId, request)
     }
 
     pub(crate) async fn acceptSpaceApprovalCall(&self, origin: &str, request: CoreCallRequest) -> Result<CoreValue, String> {
@@ -587,6 +738,7 @@ impl RuntimeRemoteLinkService {
                         deviceInfo: LinkDeviceInfo {
                             platform: String::new(),
                             model: peer.displayName.clone(),
+                            pairingIncarnation: peer.pairingIncarnation.clone(),
                         },
                         inbound: peer.inbound,
                         outbound: peer.outbound,
@@ -665,6 +817,34 @@ impl RuntimeRemoteLinkService {
             .map_err(|error| error.to_string())?.contains(&deviceId))
     }
 
+    /// Moves one chat whose route metadata cannot be presented onto this device.
+    ///
+    /// This only rewrites the Binding. It does not resume an in-progress turn.
+    #[allow(non_snake_case)]
+    pub fn claimMissingBindingLocal(&self, chatId: String) -> Result<(), String> {
+        if chatId.trim().is_empty() {
+            return Err("route claim chat id must not be empty".to_string());
+        }
+        if self.nodeRouter.bindingRouteStatus(chatId.clone()).is_ok() {
+            return Err("binding owner is already known".to_string());
+        }
+        let localNodeId = self.nodeRouter.localNodeId();
+        let bindingStore = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
+        match bindingStore.bindingOptional(&chatId)? {
+            Some(binding) if binding.nodeId == localNodeId => {
+                Err("current device profile is still missing for this chat binding".to_string())
+            }
+            Some(binding) => {
+                bindingStore.compareAndSet(&chatId, &binding.nodeId, &localNodeId)?;
+                Ok(())
+            }
+            None => {
+                bindingStore.createLocal(&chatId)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Commits a chat Binding change, installs it on the target Core, and resumes there.
     #[allow(non_snake_case)]
     pub async fn requestChangeRoute(
@@ -685,12 +865,12 @@ impl RuntimeRemoteLinkService {
                 "route change target is not a member of the current device space: {targetNodeId}"
             ));
         }
-        if !self
-            .networkControlStore
-            .nodeHasCapability(&targetNodeId, "runtime.execute", None)?
+        if !self.spaceStore.deviceProfiles()?.get(&targetNodeId)
+            .is_some_and(|profile| profile.coreVersion.is_some())
+            || !self.networkControlStore.nodeHasCapability(&targetNodeId, "runtime.execute", None)?
         {
             return Err(format!(
-                "route change target cannot execute runtime work: {targetNodeId}"
+                "route change target cannot host Core execution: {targetNodeId}"
             ));
         }
         let localNodeId = self.nodeRouter.localNodeId();
@@ -710,7 +890,7 @@ impl RuntimeRemoteLinkService {
         let routeChangeStartedAt = currentTimeMillis();
         let bindingStore = CoreNodeBindingStore::new(self.localRuntime.runtimeStorageHost())?;
         let currentBinding = bindingStore.binding(&chatId)?;
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.binding_observed chatId={} local={} currentOwner={} currentGeneration={} target={} elapsedMs={}",
@@ -721,9 +901,10 @@ impl RuntimeRemoteLinkService {
                 targetNodeId,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         if currentBinding.nodeId == targetNodeId {
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.noop chatId={} owner={} generation={} elapsedMs={}",
@@ -732,11 +913,12 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
         }
 
         if targetNodeId != localNodeId {
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.sync_before_commit.start chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -746,11 +928,12 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
             self.persistenceSyncService()
-                .synchronizeReachablePeer(targetNodeId.clone(), 512, false)
+                .synchronizeReachablePeer(targetNodeId.clone(), 512)
                 .await?;
-            operit_util::AppLogger::AppLogger::trace(
+            operit_util::AppLogger::AppLogger::v_with_level(
                 "CoreRouteTrace",
                 &format!(
                     "route_change.sync_before_commit.done chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -760,6 +943,7 @@ impl RuntimeRemoteLinkService {
                     currentBinding.generation,
                     currentTimeMillis() - routeChangeStartedAt
                 ),
+                operit_util::AppLogger::VERBOSE_LEVEL_2,
             );
         }
 
@@ -770,7 +954,7 @@ impl RuntimeRemoteLinkService {
                 commit.binding.nodeId
             ));
         }
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.binding_committed chatId={} fromOwner={} target={} generation={} elapsedMs={}",
@@ -780,12 +964,13 @@ impl RuntimeRemoteLinkService {
                 commit.binding.generation,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
 
         self.installRouteBindingOnTarget(&targetNodeId, commit.operation.clone())
             .await?;
 
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.lifecycle.after.start chatId={} target={} generation={} elapsedMs={}",
@@ -794,6 +979,7 @@ impl RuntimeRemoteLinkService {
                 commit.binding.generation,
                 currentTimeMillis() - routeChangeStartedAt
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         let lifecycleResult = self
             .callChatCoreLifecycle(
@@ -803,7 +989,7 @@ impl RuntimeRemoteLinkService {
                 Some(resumeContext),
             )
             .await;
-        operit_util::AppLogger::AppLogger::trace(
+        operit_util::AppLogger::AppLogger::v_with_level(
             "CoreRouteTrace",
             &format!(
                 "route_change.lifecycle.after.done target={} generation={} elapsedMs={} result={}",
@@ -816,6 +1002,7 @@ impl RuntimeRemoteLinkService {
                     "error"
                 }
             ),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         lifecycleResult
     }
@@ -940,8 +1127,15 @@ impl RuntimeRemoteLinkService {
 fn runtimeDeviceSpaceDevice(
     profile: &CoreSpaceDeviceProfile,
     online: bool,
+    routePlan: Option<&CoreSpaceRoutePlan>,
     currentIdentity: Option<RuntimeDeviceSpaceIdentity>,
 ) -> RuntimeDeviceSpaceDevice {
+    // Only a plan with more than one hop reports a relay: a single-hop plan is the
+    // direct Peer Link the local device already observes itself.
+    let (relayHops, relayPath) = match routePlan {
+        Some(plan) if plan.hops() > 1 => (Some(plan.hops()), Some(plan.path.clone())),
+        _ => (None, None),
+    };
     RuntimeDeviceSpaceDevice {
         deviceId: profile.nodeId.clone(),
         userName: profile.userName.clone(),
@@ -950,6 +1144,8 @@ fn runtimeDeviceSpaceDevice(
         model: profile.model.clone(),
         coreVersion: profile.coreVersion.clone(),
         online,
+        relayHops,
+        relayPath,
         currentIdentity,
     }
 }
@@ -1004,9 +1200,11 @@ fn runtimeDeviceSpaceConnectionState(
         reasons.push("Core version is unavailable".to_string());
         RuntimeDeviceSpaceConnectionStatus::Unknown
     } else if directlyOnline.is_none() {
-        reasons
-            .push("Direct Peer Link status is not observable from the current device".to_string());
-        RuntimeDeviceSpaceConnectionStatus::Unknown
+        reasons.push(
+            "Announced by its owning device; the local device cannot observe this link directly"
+                .to_string(),
+        );
+        RuntimeDeviceSpaceConnectionStatus::Announced
     } else {
         RuntimeDeviceSpaceConnectionStatus::Online
     };
@@ -1089,6 +1287,6 @@ impl crate::NodeSpaceService::NodeSpaceContext for RuntimeRemoteLinkService {
         self.nodeRouter.callNode(node, request).await
     }
     async fn afterJoined(&self, peer: String) -> Result<(), String> {
-        self.persistenceSyncService().synchronizeReachablePeer(peer, 512, true).await.map(|_| ())
+        self.persistenceSyncService().synchronizeReachablePeer(peer, 512).await.map(|_| ())
     }
 }
